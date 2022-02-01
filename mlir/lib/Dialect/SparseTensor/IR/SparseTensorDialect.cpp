@@ -340,12 +340,58 @@ static LogicalResult verify(OutOp op) {
 // Sparse Tensor Custom Linalg.Generic Operations.
 //===----------------------------------------------------------------------===//
 
-static LogicalResult verify(LinalgOp op) {
-  // TODO: verify that block has correct number of arguments
+static LogicalResult verify(LinalgIntersectOp op) {
+  Region &region = op.formula();
+  Block &formula = region.front();
+  if (formula.getNumArguments() != 2)
+    return op.emitError("block must have 2 arguments");
+
+  Type outputType = op.getResult().getType();
+  Operation &term = formula.back();
+  Value lastVal = term.getResult(0);
+  if (lastVal.getType() != outputType)
+    return op.emitError("final value in block must have same type as intersect return type");
+
   return success();
 }
 
-static LogicalResult verify(YieldOp op) {
+static LogicalResult verify(LinalgUnionOp op) {
+  Region &region = op.formula();
+  Block &formula = region.front();
+  if (formula.getNumArguments() != 2)
+    return op.emitError("block must have 2 arguments");
+
+  Type outputType = op.getResult().getType();
+  Operation &term = formula.back();
+  Value lastVal = term.getResult(0);
+  if (lastVal.getType() != outputType)
+    return op.emitError("final value in block must have same type as union return type");
+
+  return success();
+}
+
+static LogicalResult verify(LinalgReduceOp op) {
+  Region &formulaRegion = op.formula();
+  Block &formula = formulaRegion.front();
+  if (formula.getNumArguments() != 2)
+    return op.emitError("formula block must have 2 arguments");
+
+  Type outputType = op.getResult().getType();
+  Operation &term = formula.back();
+  Value lastVal = term.getResult(0);
+  if (lastVal.getType() != outputType)
+    return op.emitError("final value in formula block must have same type as reduce return type");
+
+  Region &initRegion = op.init();
+  Block &init = initRegion.front();
+  if (init.getNumArguments() != 0)
+    return op.emitError("init block must not have any arguments");
+
+  Operation &initTerm = init.back();
+  lastVal = initTerm.getResult(0);
+  if (lastVal.getType() != outputType)
+    return op.emitError("final value in init block must have same type as reduce return type");
+
   return success();
 }
 

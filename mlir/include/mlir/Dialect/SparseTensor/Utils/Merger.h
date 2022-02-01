@@ -63,6 +63,7 @@ enum Kind {
   // Custom binary
   kIntersect,
   kUnion,
+  kReduce,
 };
 
 /// Children subexpressions of tensor operations.
@@ -229,6 +230,11 @@ public:
   /// tensor (sub)expression and the next loop index in the iteration graph.
   /// Returns index of the root expression.
   unsigned buildLattices(unsigned e, unsigned i);
+
+  /// Returns the identity value (i.e. x op identity == x)
+  /// This value is used in reductions as the initial value, meant to have
+  /// no impact on the final reduction value.
+  Value getIdentity(PatternRewriter &rewriter, Location loc, unsigned e, Type tp);
 
   /// Builds a tensor expression from the given Linalg operation.
   /// Returns index of the root expression on success.

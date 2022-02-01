@@ -12,7 +12,6 @@
 
 #include "mlir/IR/Operation.h"
 #include "llvm/Support/Debug.h"
-#include <iostream>
 
 namespace mlir {
 namespace sparse_tensor {
@@ -56,6 +55,7 @@ TensorExp::TensorExp(Kind k, unsigned x, unsigned y, Value v, Operation *op)
     break;
   case kIntersect:
   case kUnion:
+  case kReduce:
     assert(x != -1u && y != -1u && op);
     children.e0 = x;
     children.e1 = y;
@@ -336,6 +336,8 @@ static const char *kindToOpSymbol(Kind kind) {
     return "CustomLinalgIntersect";
   case kUnion:
     return "CustomLinalgUnion";
+  case kReduce:
+    return "CustomLinalgReduce";
   }
   llvm_unreachable("unexpected kind for symbol");
 }
@@ -539,8 +541,44 @@ unsigned Merger::buildLattices(unsigned e, unsigned i) {
                     buildLattices(tensorExps[e].children.e0, i),
                     buildLattices(tensorExps[e].children.e1, i),
                     tensorExps[e].operation);
+  case kReduce:
+    return takeConj(kind,
+                    buildLattices(tensorExps[e].children.e0, i),
+                    buildLattices(tensorExps[e].children.e1, i),
+                    tensorExps[e].operation);
   }
   llvm_unreachable("unexpected expression kind");
+}
+
+Value Merger::getIdentity(PatternRewriter &rewriter, Location loc, unsigned e, Type tp) {
+  Kind kind = tensorExps[e].kind;
+  switch (kind) {
+  case kAddF:
+  case kAddI:
+  case kOrI:
+    return rewriter.create<arith::ConstantOp>(loc, tp, rewriter.getZeroAttr(tp));
+  case kMulF:
+    return rewriter.create<arith::ConstantOp>(loc, tp, rewriter.getFloatAttr(tp, 1.0));
+  case kMulI:
+  case kAndI:
+    return rewriter.create<arith::ConstantOp>(loc, tp, rewriter.getIntegerAttr(tp, 1));
+  case kReduce:
+    {
+      // Insert identity from init block
+      Operation *origOp = tensorExps[e].operation;
+      sparse_tensor::LinalgReduceOp laop = llvm::dyn_cast_or_null<sparse_tensor::LinalgReduceOp>(origOp);
+      Region &region = laop.init();
+      Block &formula = region.front();
+      Operation &term = formula.back();
+      Operation *placeholder = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+      rewriter.mergeBlockBefore(&formula, placeholder, {});
+      rewriter.eraseOp(placeholder);
+      Value retVal = term.getResult(0);
+      return retVal;
+    }
+  default:
+    return rewriter.create<arith::ConstantOp>(loc, tp, rewriter.getZeroAttr(tp));
+  }
 }
 
 Optional<unsigned> Merger::buildTensorExpFromLinalg(linalg::GenericOp op) {
@@ -667,15 +705,22 @@ Optional<unsigned> Merger::buildTensorExp(linalg::GenericOp op, Value v) {
         return addExp(kShrU, e0, e1);
       if (isa<arith::ShLIOp>(def) && isInvariant(e1))
         return addExp(kShlI, e0, e1);
-      if (isa<sparse_tensor::LinalgOp>(def)) {
-        sparse_tensor::LinalgOp laop = v.getDefiningOp<sparse_tensor::LinalgOp>();
-        RegionRange regions = laop.formula();
-        Region *region = regions.front();
-        Block &formula = region->front();
-        Operation *term = formula.getTerminator();
-        Kind linalgCustomKind = laop.intersect() ? kIntersect : kUnion;
-        return addExp(linalgCustomKind, e0, e1, Value(), term);
+      if (isa<sparse_tensor::LinalgIntersectOp>(def)) {
+        sparse_tensor::LinalgIntersectOp laop = v.getDefiningOp<sparse_tensor::LinalgIntersectOp>();
+        Region &region = laop.formula();
+        Block &formula = region.front();
+        Operation &term = formula.back();
+        return addExp(kIntersect, e0, e1, Value(), &term);
       }
+      if (isa<sparse_tensor::LinalgUnionOp>(def)) {
+        sparse_tensor::LinalgUnionOp laop = v.getDefiningOp<sparse_tensor::LinalgUnionOp>();
+        Region &region = laop.formula();
+        Block &formula = region.front();
+        Operation &term = formula.back();
+        return addExp(kUnion, e0, e1, Value(), &term);
+      }
+      if (isa<sparse_tensor::LinalgReduceOp>(def))
+        return addExp(kReduce, e0, e1, Value(), def);
     }
   }
   // Cannot build.
@@ -757,12 +802,26 @@ Value Merger::buildExp(PatternRewriter &rewriter, Location loc, unsigned e,
   case kIntersect:
   case kUnion:
     {
+      // Merge the formula block into the loop
       Operation *op = tensorExps[e].operation;
-      sparse_tensor::YieldOp spYield = llvm::dyn_cast_or_null<sparse_tensor::YieldOp>(op);
-      Operation *scfYield = rewriter.getBlock()->getTerminator();
-      rewriter.mergeBlockBefore(op->getBlock(), scfYield, {v0, v1});
-      Value retVal = spYield.values().front();
-      rewriter.eraseOp(spYield);
+      Operation *placeholder = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+      rewriter.mergeBlockBefore(op->getBlock(), placeholder, {v0, v1});
+      rewriter.eraseOp(placeholder);
+      Value retVal = op->getResult(0);
+      return retVal;
+    }
+  case kReduce:
+    {
+      // Merge the formula block into the loop
+      Operation *origOp = tensorExps[e].operation;
+      sparse_tensor::LinalgReduceOp laop = llvm::dyn_cast_or_null<sparse_tensor::LinalgReduceOp>(origOp);
+      Region &region = laop.formula();
+      Block &formula = region.front();
+      Operation &term = formula.back();
+      Operation *placeholder = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+      rewriter.mergeBlockBefore(&formula, placeholder, {v0, v1});
+      rewriter.eraseOp(placeholder);
+      Value retVal = term.getResult(0);
       return retVal;
     }
 

@@ -375,48 +375,84 @@ def SparseTensor_OutOp : SparseTensor_Op<"out", []>,
 // Sparse Tensor Custom Linalg.Generic Operations.
 //===----------------------------------------------------------------------===//
 
-def SparseTensor_LinalgOp : SparseTensor_Op<"linalg", [NoSideEffect, SameTypeOperands]> {
-  let summary = "Custom operation within linalg.generic";
+def SparseTensor_LinalgIntersectOp : SparseTensor_Op<"linalg_intersect", [NoSideEffect, SameTypeOperands, NoTerminator]> {
+  let summary = "Custom intersect operation within linalg.generic";
   let description = [{
-      Special union or intersect operation for use within `linalg.generic`.
+      Special intersect operation for use within `linalg.generic`.
       The actual operation is held in a block for embedding by the sparse tensor dialect.
+      The final value in the block is the intersection result.
 
       Example:
       ```mlir
-      %result = sparse_tensor.linalg union %a, %b: f64 to f64 {
+      %result = sparse_tensor.linalg_intersect %a, %b : f64 to i8 {
         ^bb0(%v0: f64, %v1: f64):
-          %cmp = arith.cmpf "olt", %v0, %v1 : f64
-          %smaller = select %cmp, %v0, %v1 : f64
-          return %smaller : f64
-      }
-      %result = sparse_tensor.linalg intersect %a, %b: f64 to i8 {
-        ^bb0(%v0, %v1: f64):
           %cmp = arith.cmpf "oeq", %v0, %v1 : f64
           %ret_i8 = arith.extui %cmp : i1 to i8
-          return %ret_i8 : i8
       }
       ```
   }];
 
-  let arguments = (ins UnitAttr:$intersect, AnyType:$a, AnyType:$b);
+  let arguments = (ins AnyType:$a, AnyType:$b);
   let results = (outs AnyType:$output);
-  let regions = (region VariadicRegion<SizedRegion<1>>:$formula);
+  let regions = (region SizedRegion<1>:$formula);
 
   let assemblyFormat = [{
-         (`intersect` $intersect^):(`union`)? $a `,` $b attr-dict `:` type($a) `to` type($output) $formula
+         $a `,` $b attr-dict `:` type($a) `to` type($output) $formula
   }];
 }
 
-def SparseTensor_YieldOp : SparseTensor_Op<"yield", [NoSideEffect, Terminator]> {
-  let summary = "Yield at end of custom linalg operation";
+def SparseTensor_LinalgUnionOp : SparseTensor_Op<"linalg_union", [NoSideEffect, SameTypeOperands, NoTerminator]> {
+  let summary = "Custom union operation within linalg.generic";
   let description = [{
-      Stuff goes here
+      Special union operation for use within `linalg.generic`.
+      The actual operation is held in a block for embedding by the sparse tensor dialect.
+      The final value in the block is the union result.
+
+      Example:
+      ```mlir
+      %result = sparse_tensor.linalg_union %a, %b: f64 to f64 {
+        ^bb0(%v0: f64, %v1: f64):
+          %cmp = arith.cmpf "olt", %v0, %v1 : f64
+          %smaller = select %cmp, %v0, %v1 : f64
+      }
+      ```
   }];
 
-  let arguments = (ins Variadic<AnyType>:$values);
+  let arguments = (ins AnyType:$a, AnyType:$b);
+  let results = (outs AnyType:$output);
+  let regions = (region SizedRegion<1>:$formula);
 
   let assemblyFormat = [{
-         $values attr-dict `:` type($values)
+         $a `,` $b attr-dict `:` type($a) `to` type($output) $formula
+  }];
+}
+
+def SparseTensor_LinalgReduceOp : SparseTensor_Op<"linalg_reduce", [NoSideEffect, SameTypeOperands, NoTerminator]> {
+  let summary = "Custom reduce operation within linalg.generic";
+  let description = [{
+      Special reduce operation for use within `linalg.generic`.
+      The actual operation is held in a block for embedding by the sparse tensor dialect.
+      The final value in the formula block is the reduction result.
+
+      A separate "init" block contains the starting value for the reduction.
+
+      Example:
+      ```mlir
+      %result = sparse_tensor.linalg_reduce %a, %b : f64 to f64 {
+        ^bb0(%v0: f64, %v1: f64):
+          %ret = arith.addf %v0, %v1 : f64
+      } init {
+        %init = arith.constant 0.0 : f64
+      }
+      ```
+  }];
+
+  let arguments = (ins AnyType:$a, AnyType:$b);
+  let results = (outs AnyType:$output);
+  let regions = (region SizedRegion<1>:$formula, SizedRegion<1>:$init);
+
+  let assemblyFormat = [{
+         $a `,` $b attr-dict `:` type($a) `to` type($output) $formula `init` $init
   }];
 }
 

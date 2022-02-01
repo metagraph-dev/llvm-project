@@ -42,7 +42,7 @@ namespace {
 enum SortMask { kSparseOnly = 0x0, kIncludeDense = 0x1, kIncludeUndef = 0x2 };
 
 // Reduction kinds.
-enum Reduction { kNoReduc, kSum, kProduct, kAnd, kOr, kXor };
+enum Reduction { kNoReduc, kSum, kProduct, kAnd, kOr, kXor, kCustom };
 
 // Code generation.
 struct CodeGen {
@@ -369,6 +369,8 @@ static StringRef getReductionName(Reduction kind) {
     return "or";
   case kXor:
     return "xor";
+  case kCustom:
+    return "custom";
   }
   llvm_unreachable("unknown reduction kind");
 }
@@ -390,6 +392,8 @@ static Reduction getReduction(Kind kind) {
     return kOr;
   case Kind::kXorI:
     return kXor;
+  case Kind::kReduce:
+    return kCustom;
   default:
     llvm_unreachable("unexpected reduction operator");
   }
@@ -404,6 +408,7 @@ static Value genVectorReducInit(CodeGen &codegen, PatternRewriter &rewriter,
   Value r = codegen.redVal;
   switch (codegen.redKind) {
   case kNoReduc:
+  case kCustom:
     break;
   case kSum:
   case kXor:
@@ -702,17 +707,35 @@ static Value genSubscript(CodeGen &codegen, PatternRewriter &rewriter,
 }
 
 /// Generates insertion code to implement dynamic tensor load.
-static Value genInsertionLoad(CodeGen &codegen, PatternRewriter &rewriter,
+static Value genInsertionLoad(Merger &merger, CodeGen &codegen, PatternRewriter &rewriter,
                               linalg::GenericOp op, OpOperand *t) {
   Location loc = op.getLoc();
+  Type tp = getElementTypeOrSelf(t->get().getType());
   // Direct lexicographic index order, tensor loads as zero.
   if (!codegen.expValues) {
-    Type tp = getElementTypeOrSelf(t->get().getType());
-    return constantZero(rewriter, loc, tp);
+    if (codegen.redKind == kNoReduc)
+      return constantZero(rewriter, loc, tp);
+    else
+      return merger.getIdentity(rewriter, loc, codegen.redExp, tp);
   }
   // Load from expanded access pattern.
   Value index = genIndex(codegen, op, t);
-  return rewriter.create<memref::LoadOp>(loc, codegen.expValues, index);
+  if (codegen.redKind == kNoReduc)
+    return rewriter.create<memref::LoadOp>(loc, codegen.expValues, index);
+  // Value may be filled; if not, use the reduction init value
+  Value isFilled = rewriter.create<memref::LoadOp>(loc, codegen.expFilled, index);
+  scf::IfOp if_isFilled = rewriter.create<scf::IfOp>(loc, tp, isFilled, /*else=*/true);
+  // True branch
+  rewriter.setInsertionPointToStart(if_isFilled.thenBlock());
+  Value valAtIndex = rewriter.create<memref::LoadOp>(loc, codegen.expValues, index);
+  rewriter.create<scf::YieldOp>(loc, valAtIndex);
+  // False branch
+  rewriter.setInsertionPointToStart(if_isFilled.elseBlock());
+  Value initVal = merger.getIdentity(rewriter, loc, codegen.redExp, tp);
+  rewriter.create<scf::YieldOp>(loc, initVal);
+  rewriter.setInsertionPointAfter(if_isFilled);
+  // End if
+  return if_isFilled.getResult(0);
 }
 
 /// Generates insertion code to implement dynamic tensor store.
@@ -770,7 +793,7 @@ static Value genTensorLoad(Merger &merger, CodeGen &codegen,
   // Load during insertion.
   OpOperand *t = op.getInputAndOutputOperands()[merger.exp(exp).tensor];
   if (t == codegen.sparseOut)
-    return genInsertionLoad(codegen, rewriter, op, t);
+    return genInsertionLoad(merger, codegen, rewriter, op, t);
   // Actual load.
   SmallVector<Value, 4> args;
   Value ptr = genSubscript(codegen, rewriter, op, t, args);
@@ -876,16 +899,24 @@ static Value genAddress(CodeGen &codegen, PatternRewriter &rewriter,
 
 /// Recursively generates tensor expression.
 static Value genExp(Merger &merger, CodeGen &codegen, PatternRewriter &rewriter,
-                    linalg::GenericOp op, unsigned exp) {
+                    linalg::GenericOp op, unsigned exp, unsigned last = 0) {
   Location loc = op.getLoc();
   if (exp == -1u)
     return Value();
-  if (merger.exp(exp).kind == Kind::kTensor)
-    return genTensorLoad(merger, codegen, rewriter, op, exp);
+  if (merger.exp(exp).kind == Kind::kTensor) {
+    OpOperand *t = op.getInputAndOutputOperands()[merger.exp(exp).tensor];
+    OpOperand *lhs = op.getOutputOperand(0);
+    if (lhs == t) {
+      codegen.redKind = getReduction(merger.exp(last).kind);
+      codegen.redExp = last;
+    }
+    Value redVal = genTensorLoad(merger, codegen, rewriter, op, exp);
+    return redVal;
+  }
   if (merger.exp(exp).kind == Kind::kInvariant)
     return genInvariantValue(merger, codegen, rewriter, exp);
-  Value v0 = genExp(merger, codegen, rewriter, op, merger.exp(exp).children.e0);
-  Value v1 = genExp(merger, codegen, rewriter, op, merger.exp(exp).children.e1);
+  Value v0 = genExp(merger, codegen, rewriter, op, merger.exp(exp).children.e0, exp);
+  Value v1 = genExp(merger, codegen, rewriter, op, merger.exp(exp).children.e1, exp);
   return merger.buildExp(rewriter, loc, exp, v0, v1);
 }
 
@@ -914,7 +945,7 @@ static bool isInvariantAffine(const CodeGen &codegen, AffineExpr a,
 static void genInvariants(Merger &merger, CodeGen &codegen,
                           PatternRewriter &rewriter, linalg::GenericOp op,
                           unsigned exp, unsigned ldx, bool atStart,
-                          Kind last = Kind::kTensor) {
+                          unsigned last = 0) {
   if (exp == -1u)
     return;
   if (merger.exp(exp).kind == Kind::kTensor) {
@@ -935,10 +966,12 @@ static void genInvariants(Merger &merger, CodeGen &codegen,
     if (lhs == t) {
       // Start or end a scalarized reduction
       if (atStart) {
+        codegen.redKind = getReduction(merger.exp(last).kind);
+        codegen.redExp = last; // this allows for custom reduction initialization
         Value load = genTensorLoad(merger, codegen, rewriter, op, exp);
-        codegen.redKind = getReduction(last);
-        codegen.redExp = exp;
+        codegen.redExp = exp; // this ties the initial reduction to the output tensor
         updateReduc(merger, codegen, load);
+
       } else {
         Value redVal = codegen.redVal;
         updateReduc(merger, codegen, Value());
@@ -955,11 +988,10 @@ static void genInvariants(Merger &merger, CodeGen &codegen,
     // Traverse into the binary operations. Note that we only hoist
     // tensor loads, since subsequent MLIR/LLVM passes know how to
     // deal with all other kinds of derived loop invariants.
-    Kind last = merger.exp(exp).kind;
     unsigned e0 = merger.exp(exp).children.e0;
     unsigned e1 = merger.exp(exp).children.e1;
-    genInvariants(merger, codegen, rewriter, op, e0, ldx, atStart, last);
-    genInvariants(merger, codegen, rewriter, op, e1, ldx, atStart, last);
+    genInvariants(merger, codegen, rewriter, op, e0, ldx, atStart, exp);
+    genInvariants(merger, codegen, rewriter, op, e1, ldx, atStart, exp);
   }
 }
 
