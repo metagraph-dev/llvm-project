@@ -911,6 +911,8 @@ static Value genExp(Merger &merger, CodeGen &codegen, PatternRewriter &rewriter,
       codegen.redExp = last;
     }
     Value redVal = genTensorLoad(merger, codegen, rewriter, op, exp);
+    if (lhs == t)
+      codegen.redExp = exp;
     return redVal;
   }
   if (merger.exp(exp).kind == Kind::kInvariant)
