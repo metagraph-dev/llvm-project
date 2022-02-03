@@ -53,7 +53,7 @@ struct CodeGen {
         indices(numTensors, std::vector<Value>(numLoops)),
         highs(numTensors, std::vector<Value>(numLoops)),
         pidxs(numTensors, std::vector<Value>(numLoops)),
-        idxs(numTensors, std::vector<Value>(numLoops)), redExp(-1u), redVal(),
+        idxs(numTensors, std::vector<Value>(numLoops)), redExp(-1u), redVal(), redValidLexInsert(),
         redKind(kNoReduc), sparseOut(op), outerParNest(nest), lexIdx(),
         expValues(), expFilled(), expAdded(), expCount(), curVecLength(1),
         curVecMask() {}
@@ -80,6 +80,7 @@ struct CodeGen {
   /// reduction are exhausted, all inner loops can use a scalarized reduction.
   unsigned redExp;
   Value redVal;
+  Value redValidLexInsert;
   Reduction redKind;
   // Sparse tensor as output. Implemented either through direct injective
   // insertion in lexicographic index order (where indices are updated
@@ -439,9 +440,10 @@ static Value genVectorReducEnd(CodeGen &codegen, PatternRewriter &rewriter,
 }
 
 /// Updates scalarized reduction value.
-static void updateReduc(Merger &merger, CodeGen &codegen, Value reduc) {
+static void updateReduc(Merger &merger, CodeGen &codegen, Value reduc, Value validLexInsert = Value()) {
   assert(codegen.redKind != kNoReduc);
   codegen.redVal = merger.exp(codegen.redExp).val = reduc;
+  codegen.redValidLexInsert = validLexInsert;
 }
 
 //===----------------------------------------------------------------------===//
@@ -740,11 +742,18 @@ static Value genInsertionLoad(Merger &merger, CodeGen &codegen, PatternRewriter 
 
 /// Generates insertion code to implement dynamic tensor store.
 static void genInsertionStore(CodeGen &codegen, PatternRewriter &rewriter,
-                              linalg::GenericOp op, OpOperand *t, Value rhs) {
+                              linalg::GenericOp op, OpOperand *t, Value rhs, Value validLexInsert) {
   Location loc = op.getLoc();
   // Direct insertion in lexicographic index order.
   if (!codegen.expValues) {
-    rewriter.create<LexInsertOp>(loc, t->get(), codegen.lexIdx, rhs);
+    if (!validLexInsert)
+      rewriter.create<LexInsertOp>(loc, t->get(), codegen.lexIdx, rhs);
+    else {
+      scf::IfOp ifValidLexInsert = rewriter.create<scf::IfOp>(loc, validLexInsert);
+      rewriter.setInsertionPointToStart(ifValidLexInsert.thenBlock());
+      rewriter.create<LexInsertOp>(loc, t->get(), codegen.lexIdx, rhs);
+      rewriter.setInsertionPointAfter(ifValidLexInsert);
+    }
     return;
   }
   // Generates insertion code along expanded access pattern.
@@ -805,20 +814,20 @@ static Value genTensorLoad(Merger &merger, CodeGen &codegen,
 /// Generates a store on a dense or sparse tensor.
 static void genTensorStore(Merger &merger, CodeGen &codegen,
                            PatternRewriter &rewriter, linalg::GenericOp op,
-                           Value rhs) {
+                           Value rhs, Value validLexInsert) {
   Location loc = op.getLoc();
   // Test if this is a scalarized reduction.
   if (codegen.redVal) {
     if (codegen.curVecLength > 1)
       rhs = rewriter.create<SelectOp>(loc, codegen.curVecMask, rhs,
                                       codegen.redVal);
-    updateReduc(merger, codegen, rhs);
+    updateReduc(merger, codegen, rhs, validLexInsert);
     return;
   }
   // Store during insertion.
   OpOperand *t = op.getOutputOperand(0);
   if (t == codegen.sparseOut) {
-    genInsertionStore(codegen, rewriter, op, t, rhs);
+    genInsertionStore(codegen, rewriter, op, t, rhs, validLexInsert);
     return;
   }
   // Actual store.
@@ -976,10 +985,11 @@ static void genInvariants(Merger &merger, CodeGen &codegen,
 
       } else {
         Value redVal = codegen.redVal;
-        updateReduc(merger, codegen, Value());
+        Value redValidLexInsert = codegen.redValidLexInsert;
+        updateReduc(merger, codegen, Value(), Value());
         codegen.redExp = -1u;
         codegen.redKind = kNoReduc;
-        genTensorStore(merger, codegen, rewriter, op, redVal);
+        genTensorStore(merger, codegen, rewriter, op, redVal, redValidLexInsert);
       }
     } else {
       // Start or end loop invariant hoisting of a tensor load.
@@ -1213,6 +1223,7 @@ static Operation *genWhile(Merger &merger, CodeGen &codegen,
   SmallVector<Type, 4> types;
   SmallVector<Value, 4> operands;
   // Construct the while-loop with a parameter for each index.
+  Location loc = op.getLoc();
   Type indexType = rewriter.getIndexType();
   for (unsigned b = 0, be = indices.size(); b < be; b++) {
     if (indices[b] && merger.isDim(b, Dim::kSparse)) {
@@ -1225,6 +1236,12 @@ static Operation *genWhile(Merger &merger, CodeGen &codegen,
   if (codegen.redVal) {
     types.push_back(codegen.redVal.getType());
     operands.push_back(codegen.redVal);
+    if (codegen.sparseOut) {
+      Type boolType = rewriter.getIntegerType(1);
+      Value falseval = rewriter.create<arith::ConstantIntOp>(loc, 0, boolType);
+      types.push_back(boolType);
+      operands.push_back(falseval);
+    }
   }
   if (codegen.expValues) {
     types.push_back(indexType);
@@ -1235,7 +1252,6 @@ static Operation *genWhile(Merger &merger, CodeGen &codegen,
     operands.push_back(codegen.loops[idx]);
   }
   assert(types.size() == operands.size());
-  Location loc = op.getLoc();
   scf::WhileOp whileOp = rewriter.create<scf::WhileOp>(loc, types, operands);
 
   SmallVector<Location> locs(types.size(), loc);
@@ -1259,8 +1275,15 @@ static Operation *genWhile(Merger &merger, CodeGen &codegen,
       codegen.pidxs[tensor][idx] = after->getArgument(o++);
     }
   }
-  if (codegen.redVal)
-    updateReduc(merger, codegen, after->getArgument(o++));
+  if (codegen.redVal) {
+    if (codegen.sparseOut) {
+      BlockArgument valArg = after->getArgument(o++);
+      BlockArgument validLexArg = after->getArgument(o++);
+      updateReduc(merger, codegen, valArg, validLexArg);
+    } else {
+      updateReduc(merger, codegen, after->getArgument(o++));
+    }
+  }
   if (codegen.expValues)
     codegen.expCount = after->getArgument(o++);
   if (needsUniv)
@@ -1367,7 +1390,13 @@ static void genWhileInduction(Merger &merger, CodeGen &codegen,
       SmallVector<Value, 4> yields;
       if (codegen.redVal) {
         yields.push_back(codegen.redVal);
-        updateReduc(merger, codegen, ifOp.getResult(y++));
+        Value valArg = ifOp.getResult(y++);
+        if (codegen.redValidLexInsert) {
+          yields.push_back(codegen.redValidLexInsert);
+          Value validLexArg = ifOp.getResult(y++);
+          updateReduc(merger, codegen, valArg, validLexArg);
+        } else
+          updateReduc(merger, codegen, valArg);
       }
       if (codegen.expValues) {
         yields.push_back(codegen.expCount);
@@ -1403,7 +1432,14 @@ static void genWhileInduction(Merger &merger, CodeGen &codegen,
   }
   if (codegen.redVal) {
     operands.push_back(codegen.redVal);
-    updateReduc(merger, codegen, whileOp->getResult(o++));
+    OpResult valArg = whileOp->getResult(o++);
+    if (codegen.redValidLexInsert) {
+      operands.push_back(codegen.redValidLexInsert);
+      OpResult validLexArg = whileOp->getResult(o++);
+      updateReduc(merger, codegen, valArg, validLexArg);
+    } else {
+      updateReduc(merger, codegen, valArg);
+    }
   }
   if (codegen.expValues) {
     operands.push_back(codegen.expCount);
@@ -1428,7 +1464,13 @@ static void genForInduction(Merger &merger, CodeGen &codegen,
   SmallVector<Value, 4> operands;
   if (codegen.redVal) {
     operands.push_back(codegen.redVal);
-    updateReduc(merger, codegen, loop->getResult(o++));
+    OpResult valArg = loop->getResult(o++);
+    if (codegen.redValidLexInsert) {
+      operands.push_back(codegen.redValidLexInsert);
+      OpResult validLexArg = loop->getResult(o++);
+      updateReduc(merger, codegen, valArg, validLexArg);
+    } else
+      updateReduc(merger, codegen, valArg);
   }
   if (codegen.expValues) {
     operands.push_back(codegen.expCount);
@@ -1463,8 +1505,11 @@ static scf::IfOp genIf(Merger &merger, CodeGen &codegen,
       cond = cond ? rewriter.create<arith::AndIOp>(loc, cond, clause) : clause;
     }
   }
-  if (codegen.redVal)
+  if (codegen.redVal) {
     types.push_back(codegen.redVal.getType());
+    if (codegen.sparseOut)
+      types.push_back(codegen.redValidLexInsert.getType());
+  }
   if (codegen.expValues)
     types.push_back(rewriter.getIndexType());
   scf::IfOp ifOp = rewriter.create<scf::IfOp>(loc, types, cond, /*else=*/true);
@@ -1475,11 +1520,13 @@ static scf::IfOp genIf(Merger &merger, CodeGen &codegen,
 /// Generates end of true branch of if-statement within a while-loop.
 static void endIf(Merger &merger, CodeGen &codegen, PatternRewriter &rewriter,
                   linalg::GenericOp op, scf::IfOp ifOp, Operation *loop,
-                  Value redInput, Value cntInput) {
+                  Value redInput, Value redValidLexInsert, Value cntInput) {
   SmallVector<Value, 4> operands;
   if (codegen.redVal) {
     operands.push_back(codegen.redVal);
-    updateReduc(merger, codegen, redInput);
+    if (codegen.redValidLexInsert)
+      operands.push_back(codegen.redValidLexInsert);
+    updateReduc(merger, codegen, redInput, redValidLexInsert);
   }
   if (codegen.expValues) {
     operands.push_back(codegen.expCount);
@@ -1581,7 +1628,15 @@ static void genStmt(Merger &merger, CodeGen &codegen, PatternRewriter &rewriter,
   // At each leaf, assign remaining tensor (sub)expression to output tensor.
   if (at == topSort.size()) {
     Value rhs = genExp(merger, codegen, rewriter, op, exp);
-    genTensorStore(merger, codegen, rewriter, op, rhs);
+    Value validLexInsert;
+    if (codegen.redValidLexInsert) {
+      Location loc = op.getLoc();
+      Type boolType = rewriter.getIntegerType(1);
+      validLexInsert = rewriter.create<arith::ConstantIntOp>(loc, 1, boolType);
+    } else {
+      validLexInsert = Value();
+    }
+    genTensorStore(merger, codegen, rewriter, op, rhs, validLexInsert);
     return;
   }
 
@@ -1605,6 +1660,7 @@ static void genStmt(Merger &merger, CodeGen &codegen, PatternRewriter &rewriter,
     // Visit all lattices points with Li >= Lj to generate the
     // loop-body, possibly with if statements for coiteration.
     Value redInput = codegen.redVal;
+    Value redValidLexInsert = codegen.redValidLexInsert;
     Value cntInput = codegen.expCount;
     bool isWhile = dyn_cast<scf::WhileOp>(loop) != nullptr;
     for (unsigned j = 0; j < lsize; j++) {
@@ -1616,7 +1672,7 @@ static void genStmt(Merger &merger, CodeGen &codegen, PatternRewriter &rewriter,
           scf::IfOp ifOp =
               genIf(merger, codegen, rewriter, op, idx, merger.lat(lj).simple);
           genStmt(merger, codegen, rewriter, op, topSort, ej, at + 1);
-          endIf(merger, codegen, rewriter, op, ifOp, loop, redInput, cntInput);
+          endIf(merger, codegen, rewriter, op, ifOp, loop, redInput, redValidLexInsert, cntInput);
         } else {
           genStmt(merger, codegen, rewriter, op, topSort, ej, at + 1);
         }
