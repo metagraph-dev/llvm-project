@@ -1639,9 +1639,7 @@ EVT SITargetLowering::getOptimalMemOpType(
 
 bool SITargetLowering::isMemOpHasNoClobberedMemOperand(const SDNode *N) const {
   const MemSDNode *MemNode = cast<MemSDNode>(N);
-  const Value *Ptr = MemNode->getMemOperand()->getValue();
-  const Instruction *I = dyn_cast_or_null<Instruction>(Ptr);
-  return I && I->getMetadata("amdgpu.noclobber");
+  return MemNode->getMemOperand()->getFlags() & MONoClobber;
 }
 
 bool SITargetLowering::isNonGlobalAddrSpace(unsigned AS) {
@@ -5423,6 +5421,7 @@ SDValue SITargetLowering::lowerTRAP(SDValue Op, SelectionDAG &DAG) const {
     case ELF::ELFABIVERSION_AMDGPU_HSA_V3:
       return lowerTrapHsaQueuePtr(Op, DAG);
     case ELF::ELFABIVERSION_AMDGPU_HSA_V4:
+    case ELF::ELFABIVERSION_AMDGPU_HSA_V5:
       return Subtarget->supportsGetDoorbellID() ?
           lowerTrapHsa(Op, DAG) : lowerTrapHsaQueuePtr(Op, DAG);
     }
@@ -5630,6 +5629,15 @@ SDValue SITargetLowering::lowerADDRSPACECAST(SDValue Op,
       return DAG.getNode(ISD::SELECT, SL, MVT::i64, NonNull, CvtPtr,
                          FlatNullPtr);
     }
+  }
+
+  if (SrcAS == AMDGPUAS::CONSTANT_ADDRESS_32BIT &&
+      Op.getValueType() == MVT::i64) {
+    const SIMachineFunctionInfo *Info =
+        DAG.getMachineFunction().getInfo<SIMachineFunctionInfo>();
+    SDValue Hi = DAG.getConstant(Info->get32BitAddressHighBits(), SL, MVT::i32);
+    SDValue Vec = DAG.getNode(ISD::BUILD_VECTOR, SL, MVT::v2i32, Src, Hi);
+    return DAG.getNode(ISD::BITCAST, SL, MVT::i64, Vec);
   }
 
   if (ASC->getDestAddressSpace() == AMDGPUAS::CONSTANT_ADDRESS_32BIT &&
@@ -12601,4 +12609,12 @@ bool SITargetLowering::isReassocProfitable(SelectionDAG &DAG, SDValue N0,
   // base and offset
   return (DAG.isBaseWithConstantOffset(N0) &&
           hasMemSDNodeUser(*N0->use_begin()));
+}
+
+MachineMemOperand::Flags
+SITargetLowering::getTargetMMOFlags(const Instruction &I) const {
+  // Propagate metadata set by AMDGPUAnnotateUniformValues to the MMO of a load.
+  if (I.getMetadata("amdgpu.noclobber"))
+    return MONoClobber;
+  return MachineMemOperand::MONone;
 }

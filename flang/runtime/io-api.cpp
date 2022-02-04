@@ -304,7 +304,8 @@ Cookie IONAME(BeginOpenUnit)( // OPEN(without NEWUNIT=)
 Cookie IONAME(BeginOpenNewUnit)( // OPEN(NEWUNIT=j)
     const char *sourceFile, int sourceLine) {
   Terminator terminator{sourceFile, sourceLine};
-  ExternalFileUnit &unit{ExternalFileUnit::NewUnit(terminator)};
+  ExternalFileUnit &unit{
+      ExternalFileUnit::NewUnit(terminator, false /*not child I/O*/)};
   return &unit.BeginIoStatement<OpenStatementState>(
       unit, false /*was an existing file*/, sourceFile, sourceLine);
 }
@@ -460,14 +461,13 @@ bool IONAME(SetAdvance)(
 
 bool IONAME(SetBlank)(Cookie cookie, const char *keyword, std::size_t length) {
   IoStatementState &io{*cookie};
-  ConnectionState &connection{io.GetConnectionState()};
   static const char *keywords[]{"NULL", "ZERO", nullptr};
   switch (IdentifyValue(keyword, length, keywords)) {
   case 0:
-    connection.modes.editingFlags &= ~blankZero;
+    io.mutableModes().editingFlags &= ~blankZero;
     return true;
   case 1:
-    connection.modes.editingFlags |= blankZero;
+    io.mutableModes().editingFlags |= blankZero;
     return true;
   default:
     io.GetIoErrorHandler().SignalError(IostatErrorInKeyword,
@@ -479,14 +479,13 @@ bool IONAME(SetBlank)(Cookie cookie, const char *keyword, std::size_t length) {
 bool IONAME(SetDecimal)(
     Cookie cookie, const char *keyword, std::size_t length) {
   IoStatementState &io{*cookie};
-  ConnectionState &connection{io.GetConnectionState()};
   static const char *keywords[]{"COMMA", "POINT", nullptr};
   switch (IdentifyValue(keyword, length, keywords)) {
   case 0:
-    connection.modes.editingFlags |= decimalComma;
+    io.mutableModes().editingFlags |= decimalComma;
     return true;
   case 1:
-    connection.modes.editingFlags &= ~decimalComma;
+    io.mutableModes().editingFlags &= ~decimalComma;
     return true;
   default:
     io.GetIoErrorHandler().SignalError(IostatErrorInKeyword,
@@ -497,17 +496,16 @@ bool IONAME(SetDecimal)(
 
 bool IONAME(SetDelim)(Cookie cookie, const char *keyword, std::size_t length) {
   IoStatementState &io{*cookie};
-  ConnectionState &connection{io.GetConnectionState()};
   static const char *keywords[]{"APOSTROPHE", "QUOTE", "NONE", nullptr};
   switch (IdentifyValue(keyword, length, keywords)) {
   case 0:
-    connection.modes.delim = '\'';
+    io.mutableModes().delim = '\'';
     return true;
   case 1:
-    connection.modes.delim = '"';
+    io.mutableModes().delim = '"';
     return true;
   case 2:
-    connection.modes.delim = '\0';
+    io.mutableModes().delim = '\0';
     return true;
   default:
     io.GetIoErrorHandler().SignalError(IostatErrorInKeyword,
@@ -518,8 +516,7 @@ bool IONAME(SetDelim)(Cookie cookie, const char *keyword, std::size_t length) {
 
 bool IONAME(SetPad)(Cookie cookie, const char *keyword, std::size_t length) {
   IoStatementState &io{*cookie};
-  ConnectionState &connection{io.GetConnectionState()};
-  connection.modes.pad =
+  io.mutableModes().pad =
       YesOrNo(keyword, length, "PAD", io.GetIoErrorHandler());
   return true;
 }
@@ -571,27 +568,26 @@ bool IONAME(SetRec)(Cookie cookie, std::int64_t rec) {
 
 bool IONAME(SetRound)(Cookie cookie, const char *keyword, std::size_t length) {
   IoStatementState &io{*cookie};
-  ConnectionState &connection{io.GetConnectionState()};
   static const char *keywords[]{"UP", "DOWN", "ZERO", "NEAREST", "COMPATIBLE",
       "PROCESSOR_DEFINED", nullptr};
   switch (IdentifyValue(keyword, length, keywords)) {
   case 0:
-    connection.modes.round = decimal::RoundUp;
+    io.mutableModes().round = decimal::RoundUp;
     return true;
   case 1:
-    connection.modes.round = decimal::RoundDown;
+    io.mutableModes().round = decimal::RoundDown;
     return true;
   case 2:
-    connection.modes.round = decimal::RoundToZero;
+    io.mutableModes().round = decimal::RoundToZero;
     return true;
   case 3:
-    connection.modes.round = decimal::RoundNearest;
+    io.mutableModes().round = decimal::RoundNearest;
     return true;
   case 4:
-    connection.modes.round = decimal::RoundCompatible;
+    io.mutableModes().round = decimal::RoundCompatible;
     return true;
   case 5:
-    connection.modes.round = executionEnvironment.defaultOutputRoundingMode;
+    io.mutableModes().round = executionEnvironment.defaultOutputRoundingMode;
     return true;
   default:
     io.GetIoErrorHandler().SignalError(IostatErrorInKeyword,
@@ -602,16 +598,15 @@ bool IONAME(SetRound)(Cookie cookie, const char *keyword, std::size_t length) {
 
 bool IONAME(SetSign)(Cookie cookie, const char *keyword, std::size_t length) {
   IoStatementState &io{*cookie};
-  ConnectionState &connection{io.GetConnectionState()};
   static const char *keywords[]{
       "PLUS", "SUPPRESS", "PROCESSOR_DEFINED", nullptr};
   switch (IdentifyValue(keyword, length, keywords)) {
   case 0:
-    connection.modes.editingFlags |= signPlus;
+    io.mutableModes().editingFlags |= signPlus;
     return true;
   case 1:
   case 2: // processor default is SS
-    connection.modes.editingFlags &= ~signPlus;
+    io.mutableModes().editingFlags &= ~signPlus;
     return true;
   default:
     io.GetIoErrorHandler().SignalError(IostatErrorInKeyword,

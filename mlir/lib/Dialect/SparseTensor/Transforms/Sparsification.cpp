@@ -24,7 +24,7 @@
 #include "mlir/Dialect/SparseTensor/Transforms/Passes.h"
 #include "mlir/Dialect/SparseTensor/Utils/Merger.h"
 #include "mlir/Dialect/StandardOps/IR/Ops.h"
-#include "mlir/Dialect/Vector/VectorOps.h"
+#include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/IR/TensorEncoding.h"
 #include "llvm/ADT/SmallBitVector.h"
@@ -819,8 +819,8 @@ static void genTensorStore(Merger &merger, CodeGen &codegen,
   // Test if this is a scalarized reduction.
   if (codegen.redVal) {
     if (codegen.curVecLength > 1)
-      rhs = rewriter.create<SelectOp>(loc, codegen.curVecMask, rhs,
-                                      codegen.redVal);
+      rhs = rewriter.create<arith::SelectOp>(loc, codegen.curVecMask, rhs,
+                                             codegen.redVal);
     updateReduc(merger, codegen, rhs, validLexInsert);
     return;
   }
@@ -1048,7 +1048,7 @@ static void genExpansion(Merger &merger, CodeGen &codegen,
 /// maintain the universal index.
 static bool genInit(Merger &merger, CodeGen &codegen, PatternRewriter &rewriter,
                     linalg::GenericOp op, std::vector<unsigned> &topSort,
-                    unsigned at, llvm::BitVector &inits) {
+                    unsigned at, BitVector &inits) {
   bool needsUniv = false;
   Location loc = op.getLoc();
   unsigned idx = topSort[at];
@@ -1148,7 +1148,7 @@ static bool denseUnitStrides(Merger &merger, linalg::GenericOp op,
 static Operation *genFor(Merger &merger, CodeGen &codegen,
                          PatternRewriter &rewriter, linalg::GenericOp op,
                          bool isOuter, bool isInner, unsigned idx,
-                         llvm::BitVector &indices) {
+                         BitVector &indices) {
   unsigned fb = indices.find_first();
   unsigned tensor = merger.tensor(fb);
   assert(idx == merger.index(fb));
@@ -1219,7 +1219,7 @@ static Operation *genFor(Merger &merger, CodeGen &codegen,
 static Operation *genWhile(Merger &merger, CodeGen &codegen,
                            PatternRewriter &rewriter, linalg::GenericOp op,
                            unsigned idx, bool needsUniv,
-                           llvm::BitVector &indices) {
+                           BitVector &indices) {
   SmallVector<Type, 4> types;
   SmallVector<Value, 4> operands;
   // Construct the while-loop with a parameter for each index.
@@ -1299,7 +1299,7 @@ static Operation *genWhile(Merger &merger, CodeGen &codegen,
 static Operation *genLoop(Merger &merger, CodeGen &codegen,
                           PatternRewriter &rewriter, linalg::GenericOp op,
                           std::vector<unsigned> &topSort, unsigned at,
-                          bool needsUniv, llvm::BitVector &indices) {
+                          bool needsUniv, BitVector &indices) {
   unsigned idx = topSort[at];
   if (indices.count() == 1) {
     bool isOuter = at == 0;
@@ -1315,7 +1315,7 @@ static Operation *genLoop(Merger &merger, CodeGen &codegen,
 static void genLocals(Merger &merger, CodeGen &codegen,
                       PatternRewriter &rewriter, linalg::GenericOp op,
                       std::vector<unsigned> &topSort, unsigned at,
-                      bool needsUniv, llvm::BitVector &locals) {
+                      bool needsUniv, BitVector &locals) {
   Location loc = op.getLoc();
   unsigned idx = topSort[at];
 
@@ -1333,7 +1333,7 @@ static void genLocals(Merger &merger, CodeGen &codegen,
         if (min) {
           Value cmp = rewriter.create<arith::CmpIOp>(
               loc, arith::CmpIPredicate::ult, load, min);
-          min = rewriter.create<SelectOp>(loc, cmp, load, min);
+          min = rewriter.create<arith::SelectOp>(loc, cmp, load, min);
         } else {
           min = load;
         }
@@ -1379,7 +1379,7 @@ static void genLocals(Merger &merger, CodeGen &codegen,
 static void genWhileInduction(Merger &merger, CodeGen &codegen,
                               PatternRewriter &rewriter, linalg::GenericOp op,
                               unsigned idx, bool needsUniv,
-                              llvm::BitVector &induction,
+                              BitVector &induction,
                               scf::WhileOp whileOp) {
   Location loc = op.getLoc();
   // Finalize each else branch of all if statements.
@@ -1426,7 +1426,7 @@ static void genWhileInduction(Merger &merger, CodeGen &codegen,
       Value cmp = rewriter.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq,
                                                  op1, op2);
       Value add = rewriter.create<arith::AddIOp>(loc, op3, one);
-      operands.push_back(rewriter.create<SelectOp>(loc, cmp, add, op3));
+      operands.push_back(rewriter.create<arith::SelectOp>(loc, cmp, add, op3));
       codegen.pidxs[tensor][idx] = whileOp->getResult(o++);
     }
   }
@@ -1485,7 +1485,7 @@ static void genForInduction(Merger &merger, CodeGen &codegen,
 /// Generates a single if-statement within a while-loop.
 static scf::IfOp genIf(Merger &merger, CodeGen &codegen,
                        PatternRewriter &rewriter, linalg::GenericOp op,
-                       unsigned idx, llvm::BitVector &conditions) {
+                       unsigned idx, BitVector &conditions) {
   Location loc = op.getLoc();
   SmallVector<Type, 4> types;
   Value cond;

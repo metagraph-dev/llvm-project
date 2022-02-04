@@ -1009,7 +1009,7 @@ func @scf_if_non_equiv_yields(
     %B : tensor<4xf32> {linalg.inplaceable = false})
   -> tensor<4xf32>
 {
-  // CHECK: %[[r:.*]] = select %[[cond]], %[[A]], %[[B]]
+  // CHECK: %[[r:.*]] = arith.select %[[cond]], %[[A]], %[[B]]
   %r = scf.if %b -> (tensor<4xf32>) {
     scf.yield %A : tensor<4xf32>
   } else {
@@ -1321,8 +1321,8 @@ func @write_to_select_op_source(
   // CHECK: memref.copy %[[t1]], %[[alloc]]
   // CHECK: memref.store %{{.*}}, %[[alloc]]
   %w = tensor.insert %cst into %t1[%idx] : tensor<?xf32>
-  // CHECK: %[[select:.*]] = select %{{.*}}, %[[t1]], %[[t2]]
-  %s = std.select %c, %t1, %t2 : tensor<?xf32>
+  // CHECK: %[[select:.*]] = arith.select %{{.*}}, %[[t1]], %[[t2]]
+  %s = arith.select %c, %t1, %t2 : tensor<?xf32>
   // CHECK: return %[[select]], %[[alloc]]
   return %s, %w : tensor<?xf32>, tensor<?xf32>
 }
@@ -1343,8 +1343,8 @@ func @write_after_select_read_one(
   // CHECK: %[[alloc:.*]] = memref.alloc
   // CHECK: %[[casted:.*]] = memref.cast %[[alloc]]
   // CHECK: memref.copy %[[t1]], %[[alloc]]
-  // CHECK: %[[select:.*]] = select %{{.*}}, %[[casted]], %[[t2]]
-  %s = std.select %c, %t1, %t2 : tensor<?xf32>
+  // CHECK: %[[select:.*]] = arith.select %{{.*}}, %[[casted]], %[[t2]]
+  %s = arith.select %c, %t1, %t2 : tensor<?xf32>
 
   // CHECK: memref.store %{{.*}}, %[[select]]
   %w = tensor.insert %cst into %s[%idx] : tensor<?xf32>
@@ -1354,56 +1354,4 @@ func @write_after_select_read_one(
 
   // CHECK: return %[[f]], %[[select]]
   return %f, %w : f32, tensor<?xf32>
-}
-
-// -----
-
-// CHECK-LABEL: func @tensor_rank(
-//  CHECK-SAME:     %[[arg0:.*]]: memref<*xf32>
-func @tensor_rank(%arg0: tensor<*xf32>) -> index {
-  // CHECK: %[[r:.*]] = memref.rank %[[arg0]]
-  %0 = tensor.rank %arg0 : tensor<*xf32>
-  // CHECK: return %[[r]] : index
-  return %0 : index
-}
-
-// -----
-
-// CHECK-LABEL: func @tensor_generate_static_and_dynamic(
-//  CHECK-SAME:     %[[arg0:.*]]: index
-func @tensor_generate_static_and_dynamic(%arg0: index) -> tensor<16x?xindex> {
-  // CHECK-DAG: %[[c0:.*]] = arith.constant 0 : index
-  // CHECK-DAG: %[[c16:.*]] = arith.constant 16 : index
-  // CHECK: %[[alloc:.*]] = memref.alloc(%[[arg0]]) {{.*}} : memref<16x?xindex>
-  // CHECK: scf.parallel (%[[arg1:.*]], %[[arg2:.*]]) = (%[[c0]], %[[c0]]) to (%[[c16]], %[[arg0]]) {{.*}} {
-  %result = tensor.generate %arg0 {
-  ^bb0(%i: index, %j: index):
-    %sum = arith.addi %i, %j : index
-    // CHECK: memref.store {{.*}}, %[[alloc]][%[[arg1]], %[[arg2]]]
-    // CHECK: scf.yield
-    tensor.yield %sum : index
-  } : tensor<16x?xindex>
-  // CHECK: }
-  return %result : tensor<16x?xindex>
-}
-
-// -----
-
-// CHECK-LABEL: func @tensor_from_elements_2d(
-//  CHECK-SAME:     %[[ELEM0:.*]]: index, %[[ELEM1:.*]]: index
-func @tensor_from_elements_2d(%arg0: index, %arg1: index) -> tensor<3x2xindex> {
-  // CHECK-DAG: %[[C0:.*]] = arith.constant 0 : index
-  // CHECK-DAG: %[[C1:.*]] = arith.constant 1 : index
-  // CHECK-DAG: %[[C2:.*]] = arith.constant 2 : index
-  // CHECK-DAG: %[[MEMREF:.*]] = memref.alloc() {{.*}} : memref<3x2xindex>
-  //     CHECK: store %[[ELEM0]], %[[MEMREF]][%[[C0]], %[[C0]]]
-  //     CHECK: store %[[ELEM1]], %[[MEMREF]][%[[C0]], %[[C1]]]
-  //     CHECK: store %[[ELEM0]], %[[MEMREF]][%[[C1]], %[[C0]]]
-  //     CHECK: store %[[ELEM1]], %[[MEMREF]][%[[C1]], %[[C1]]]
-  //     CHECK: store %[[ELEM0]], %[[MEMREF]][%[[C2]], %[[C0]]]
-  //     CHECK: store %[[ELEM1]], %[[MEMREF]][%[[C2]], %[[C1]]]
-  %0 = tensor.from_elements %arg0, %arg1, %arg0, %arg1, %arg0, %arg1
-         : tensor<3x2xindex>
-  //     CHECK: return %[[MEMREF]]
-  return %0 : tensor<3x2xindex>
 }

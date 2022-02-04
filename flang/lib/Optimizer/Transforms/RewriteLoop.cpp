@@ -75,7 +75,7 @@ public:
       auto cond = rewriter.create<mlir::arith::CmpIOp>(
           loc, arith::CmpIPredicate::sle, iters, zero);
       auto one = rewriter.create<mlir::arith::ConstantIndexOp>(loc, 1);
-      iters = rewriter.create<mlir::SelectOp>(loc, cond, one, iters);
+      iters = rewriter.create<mlir::arith::SelectOp>(loc, cond, one, iters);
     }
 
     llvm::SmallVector<mlir::Value> loopOperands;
@@ -296,7 +296,7 @@ class CfgConversion : public CFGConversionBase<CfgConversion> {
 public:
   void runOnOperation() override {
     auto *context = &getContext();
-    mlir::OwningRewritePatternList patterns(context);
+    mlir::RewritePatternSet patterns(context);
     patterns.insert<CfgLoopConv, CfgIfConv, CfgIterWhileConv>(
         context, forceLoopToExecuteOnce);
     mlir::ConversionTarget target(*context);

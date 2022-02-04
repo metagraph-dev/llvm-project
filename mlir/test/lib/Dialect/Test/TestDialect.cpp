@@ -729,7 +729,7 @@ static void print(OpAsmPrinter &p, WrappingRegionOp op) {
 static ParseResult parsePrettyPrintedRegionOp(OpAsmParser &parser,
                                               OperationState &result) {
 
-  llvm::SMLoc loc = parser.getCurrentLocation();
+  SMLoc loc = parser.getCurrentLocation();
   Location currLocation = parser.getEncodedSourceLoc(loc);
 
   // Parse the operands.
@@ -1116,6 +1116,26 @@ void StringAttrPrettyNameOp::getAsmResultNames(
     if (auto str = value[i].dyn_cast<StringAttr>())
       if (!str.getValue().empty())
         setNameFn(getResult(i), str.getValue());
+}
+
+//===----------------------------------------------------------------------===//
+// ResultTypeWithTraitOp
+//===----------------------------------------------------------------------===//
+
+LogicalResult ResultTypeWithTraitOp::verify() {
+  if ((*this)->getResultTypes()[0].hasTrait<TypeTrait::TestTypeTrait>())
+    return success();
+  return emitError("result type should have trait 'TestTypeTrait'");
+}
+
+//===----------------------------------------------------------------------===//
+// AttrWithTraitOp
+//===----------------------------------------------------------------------===//
+
+LogicalResult AttrWithTraitOp::verify() {
+  if (getAttr().hasTrait<AttributeTrait::TestAttrTrait>())
+    return success();
+  return emitError("'attr' attribute should have trait 'TestAttrTrait'");
 }
 
 //===----------------------------------------------------------------------===//

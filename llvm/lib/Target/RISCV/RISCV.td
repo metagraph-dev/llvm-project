@@ -41,6 +41,13 @@ def HasStdExtD : Predicate<"Subtarget->hasStdExtD()">,
                            AssemblerPredicate<(all_of FeatureStdExtD),
                            "'D' (Double-Precision Floating-Point)">;
 
+def FeatureStdExtZihintpause
+    : SubtargetFeature<"zihintpause", "HasStdExtZihintpause", "true",
+                       "'zihintpause' (Pause Hint)">;
+def HasStdExtZihintpause : Predicate<"Subtarget->hasStdExtZihintpause()">,
+                                     AssemblerPredicate<(all_of FeatureStdExtZihintpause),
+                                     "'Zihintpause' (Pause Hint)">;
+
 def FeatureStdExtZfhmin
     : SubtargetFeature<"zfhmin", "HasStdExtZfhmin", "true",
                        "'Zfhmin' (Half-Precision Floating-Point Minimal)",
@@ -52,10 +59,16 @@ def HasStdExtZfhmin : Predicate<"Subtarget->hasStdExtZfhmin()">,
 def FeatureStdExtZfh
     : SubtargetFeature<"zfh", "HasStdExtZfh", "true",
                        "'Zfh' (Half-Precision Floating-Point)",
-                       [FeatureStdExtZfhmin, FeatureStdExtF]>;
+                       [FeatureStdExtF]>;
 def HasStdExtZfh : Predicate<"Subtarget->hasStdExtZfh()">,
                              AssemblerPredicate<(all_of FeatureStdExtZfh),
                              "'Zfh' (Half-Precision Floating-Point)">;
+
+def HasStdExtZfhOrZfhmin
+    : Predicate<"Subtarget->hasStdExtZfh() || Subtarget->hasStdExtZfhmin()">,
+                AssemblerPredicate<(any_of FeatureStdExtZfh, FeatureStdExtZfhmin),
+                                   "'Zfh' (Half-Precision Floating-Point) or "
+                                   "'Zfhmin' (Half-Precision Floating-Point Minimal)">;
 
 def FeatureStdExtC
     : SubtargetFeature<"c", "HasStdExtC", "true",
@@ -167,6 +180,12 @@ def HasStdExtZbpOrZbkb
     : Predicate<"Subtarget->hasStdExtZbp() || Subtarget->hasStdExtZbkb()">,
                 AssemblerPredicate<(any_of FeatureStdExtZbp, FeatureStdExtZbkb),
                                    "'Zbp' (Permutation 'Zb' Instructions) or "
+                                   "'Zbkb' (Bitmanip instructions for Cryptography)">;
+
+def HasStdExtZbbOrZbkb
+    : Predicate<"Subtarget->hasStdExtZbb() || Subtarget->hasStdExtZbkb()">,
+                AssemblerPredicate<(any_of FeatureStdExtZbb, FeatureStdExtZbkb),
+                                   "'Zbb' (Basic Bit-Manipulation) or "
                                    "'Zbkb' (Bitmanip instructions for Cryptography)">;
 
 def HasStdExtZbbOrZbpOrZbkb
