@@ -928,7 +928,7 @@ static Value genExp(Merger &merger, CodeGen &codegen, PatternRewriter &rewriter,
     return genInvariantValue(merger, codegen, rewriter, exp);
   Value v0 = genExp(merger, codegen, rewriter, op, merger.exp(exp).children.e0, exp);
   Value v1 = genExp(merger, codegen, rewriter, op, merger.exp(exp).children.e1, exp);
-  return merger.buildExp(rewriter, loc, exp, v0, v1);
+  return merger.buildExp(rewriter, loc, exp, v0, v1, codegen.lexIdx);
 }
 
 /// Determines if affine expression is invariant.

@@ -470,4 +470,31 @@ def SparseTensor_LinalgReduceOp : SparseTensor_Op<"linalg_reduce", [NoSideEffect
   let hasVerifier = 1;
 }
 
+def SparseTensor_LinalgApplyOp : SparseTensor_Op<"linalg_apply", [NoSideEffect, NoTerminator]> {
+  let summary = "Custom apply operatoin within linalg.generic";
+  let description = [{
+      Special apply operation for use within `linalg.generic`.
+      The actual operation is held in a block for embedding by the sparse tensor dialect.
+      The final value in the formula block is the modified result.
+
+      Example:
+      ```
+      %result = sparse_tensor.linalg_apply %a : f64 to f64 {
+        ^bb0(%v0: f64):
+          %cf1 = arith.constant 1.0 : f64
+          %ret = arith.addf %v0, %cf1 : f64
+      }
+      ```
+  }];
+
+  let arguments = (ins AnyType:$a);
+  let results = (outs AnyType:$output);
+  let regions = (region SizedRegion<1>:$formula);
+
+  let assemblyFormat = [{
+         $a attr-dict `:` type($a) `to` type($output) $formula
+  }];
+  let hasVerifier = 1;
+}
+
 #endif // SPARSETENSOR_OPS

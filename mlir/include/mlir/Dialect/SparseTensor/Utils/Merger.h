@@ -44,6 +44,8 @@ enum Kind {
   kCastU,  // unsigned
   kTruncI,
   kBitCast,
+  // Custom unary
+  kApply,
   // Binary operations.
   kMulF,
   kMulI,
@@ -132,8 +134,8 @@ public:
 
   /// Adds a tensor expression. Returns its index.
   unsigned addExp(Kind k, unsigned e0, unsigned e1 = -1u, Value v = Value(), Operation *op = nullptr);
-  unsigned addExp(Kind k, unsigned e, Value v) { return addExp(k, e, -1u, v); }
-  unsigned addExp(Kind k, Value v) { return addExp(k, -1u, -1u, v); }
+  unsigned addExp(Kind k, unsigned e, Value v, Operation *op = nullptr) { return addExp(k, e, -1u, v, op); }
+  unsigned addExp(Kind k, Value v, Operation *op = nullptr) { return addExp(k, -1u, -1u, v, op); }
 
   /// Adds an iteration lattice point. Returns its index.
   unsigned addLat(unsigned t, unsigned i, unsigned e);
@@ -158,7 +160,7 @@ public:
   /// Maps the unary operator over the lattice set of the operand, i.e. each
   /// lattice point on an expression E is simply copied over, but with OP E
   /// as new expression. Returns the index of the new set.
-  unsigned mapSet(Kind kind, unsigned s0, Value v = Value());
+  unsigned mapSet(Kind kind, unsigned s0, Value v = Value(), Operation *op = nullptr);
 
   /// Optimizes the iteration lattice points in the given set. This
   /// method should be called right before code generation to avoid
@@ -242,7 +244,7 @@ public:
 
   /// Rebuilds SSA format from a tensor expression.
   Value buildExp(PatternRewriter &rewriter, Location loc, unsigned e, Value v0,
-                 Value v1);
+                 Value v1, Value lexIdx);
 
 private:
   /// Private helpers.

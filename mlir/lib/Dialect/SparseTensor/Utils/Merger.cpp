@@ -53,6 +53,11 @@ TensorExp::TensorExp(Kind k, unsigned x, unsigned y, Value v, Operation *op)
     children.e0 = x;
     children.e1 = y;
     break;
+  case kApply:
+    assert(x != -1u && y == -1u && op);
+    children.e0 = x;
+    children.e1 = y;
+    break;
   case kIntersect:
   case kUnion:
   case kReduce:
@@ -132,11 +137,11 @@ unsigned Merger::takeDisj(Kind kind, unsigned s0, unsigned s1, Operation *op) {
   return s;
 }
 
-unsigned Merger::mapSet(Kind kind, unsigned s0, Value v) {
-  assert(kAbsF <= kind && kind <= kBitCast);
+unsigned Merger::mapSet(Kind kind, unsigned s0, Value v, Operation *op) {
+  assert(kAbsF <= kind && kind <= kApply);
   unsigned s = addSet();
   for (unsigned p : latSets[s0]) {
-    unsigned e = addExp(kind, latPoints[p].exp, v);
+    unsigned e = addExp(kind, latPoints[p].exp, v, op);
     latPoints.push_back(LatPoint(latPoints[p].bits, e));
     latSets[s].push_back(latPoints.size() - 1);
   }
@@ -332,6 +337,8 @@ static const char *kindToOpSymbol(Kind kind) {
     return ">>";
   case kShlI:
     return "<<";
+  case kApply:
+    return "CustomLinalgApply";
   case kIntersect:
     return "CustomLinalgIntersect";
   case kUnion:
@@ -529,6 +536,9 @@ unsigned Merger::buildLattices(unsigned e, unsigned i) {
     return takeConj(kind, // take binary conjunction
                     buildLattices(tensorExps[e].children.e0, i),
                     buildLattices(tensorExps[e].children.e1, i));
+  case kApply:
+    return mapSet(kind, buildLattices(tensorExps[e].children.e0, i),
+                  tensorExps[e].val, tensorExps[e].operation);
   case kIntersect:
     // Custom conjunction
     return takeConj(kind, // take binary conjunction
@@ -664,6 +674,13 @@ Optional<unsigned> Merger::buildTensorExp(linalg::GenericOp op, Value v) {
         return addExp(kTruncI, e, v);
       if (isa<arith::BitcastOp>(def))
         return addExp(kBitCast, e, v);
+      if (isa<sparse_tensor::LinalgApplyOp>(def)) {
+        sparse_tensor::LinalgApplyOp laop = v.getDefiningOp<sparse_tensor::LinalgApplyOp>();
+        Region &region = laop.formula();
+        Block &formula = region.front();
+        Operation &term = formula.back();
+        return addExp(kApply, e, Value(), &term);
+      }
     }
   }
   // Construct binary operations if subexpressions can be built.
@@ -728,7 +745,7 @@ Optional<unsigned> Merger::buildTensorExp(linalg::GenericOp op, Value v) {
 }
 
 Value Merger::buildExp(PatternRewriter &rewriter, Location loc, unsigned e,
-                       Value v0, Value v1) {
+                       Value v0, Value v1, Value lexIdx) {
   switch (tensorExps[e].kind) {
   case kTensor:
   case kInvariant:
@@ -799,6 +816,15 @@ Value Merger::buildExp(PatternRewriter &rewriter, Location loc, unsigned e,
     return rewriter.create<arith::ShRUIOp>(loc, v0, v1);
   case kShlI:
     return rewriter.create<arith::ShLIOp>(loc, v0, v1);
+  case kApply:
+    {
+      Operation *op = tensorExps[e].operation;
+      Operation *placeholder = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+      rewriter.mergeBlockBefore(op->getBlock(), placeholder, {v0});
+      rewriter.eraseOp(placeholder);
+      Value retVal = op->getResult(0);
+      return retVal;
+    }
   case kIntersect:
   case kUnion:
     {

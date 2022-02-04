@@ -393,6 +393,21 @@ LogicalResult LinalgReduceOp::verify() {
   return success();
 }
 
+LogicalResult LinalgApplyOp::verify() {
+  Region &region = formula();
+  Block &formula = region.front();
+  if (formula.getNumArguments() != 1)
+    return emitError("block must have 1 argument");
+
+  Type outputType = output().getType();
+  Operation &term = formula.back();
+  Value lastVal = term.getResult(0);
+  if (lastVal.getType() != outputType)
+    return emitError("final value in block must have same type as apply return type");
+
+  return success();
+}
+
 //===----------------------------------------------------------------------===//
 // TensorDialect Methods.
 //===----------------------------------------------------------------------===//
