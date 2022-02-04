@@ -410,6 +410,7 @@ def SparseTensor_LinalgIntersectOp : SparseTensor_Op<"linalg_intersect", [NoSide
   let assemblyFormat = [{
          $a `,` $b attr-dict `:` type($a) `to` type($output) $formula
   }];
+  let hasVerifier = 1;
 }
 
 def SparseTensor_LinalgUnionOp : SparseTensor_Op<"linalg_union", [NoSideEffect, SameTypeOperands, NoTerminator]> {
@@ -436,6 +437,7 @@ def SparseTensor_LinalgUnionOp : SparseTensor_Op<"linalg_union", [NoSideEffect, 
   let assemblyFormat = [{
          $a `,` $b attr-dict `:` type($a) `to` type($output) $formula
   }];
+  let hasVerifier = 1;
 }
 
 def SparseTensor_LinalgReduceOp : SparseTensor_Op<"linalg_reduce", [NoSideEffect, SameTypeOperands, NoTerminator]> {
@@ -465,6 +467,7 @@ def SparseTensor_LinalgReduceOp : SparseTensor_Op<"linalg_reduce", [NoSideEffect
   let assemblyFormat = [{
          $a `,` $b attr-dict `:` type($a) `to` type($output) $formula `init` $init
   }];
+  let hasVerifier = 1;
 }
 
 #endif // SPARSETENSOR_OPS
