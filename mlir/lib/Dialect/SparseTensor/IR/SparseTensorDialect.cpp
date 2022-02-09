@@ -345,10 +345,13 @@ LogicalResult LinalgIntersectOp::verify() {
     return emitError("block must have 2 arguments");
 
   Type outputType = output().getType();
-  Operation &term = formula.back();
-  Value lastVal = term.getResult(0);
-  if (lastVal.getType() != outputType)
-    return emitError("final value in block must have same type as intersect return type");
+  LinalgYieldOp yield =
+      llvm::dyn_cast_or_null<LinalgYieldOp>(formula.getTerminator());
+  if (yield == nullptr)
+    return emitError("intersect block must end with sparse_tensor.linalg_yield");
+  Value retVal = yield.result();
+  if (retVal.getType() != outputType)
+    return emitError("yield value in block does not match intersect return type");
 
   return success();
 }
@@ -360,10 +363,13 @@ LogicalResult LinalgUnionOp::verify() {
     return emitError("block must have 2 arguments");
 
   Type outputType = output().getType();
-  Operation &term = formula.back();
-  Value lastVal = term.getResult(0);
-  if (lastVal.getType() != outputType)
-    return emitError("final value in block must have same type as union return type");
+  LinalgYieldOp yield =
+      llvm::dyn_cast_or_null<LinalgYieldOp>(formula.getTerminator());
+  if (yield == nullptr)
+    return emitError("union block must end with sparse_tensor.linalg_yield");
+  Value retVal = yield.result();
+  if (retVal.getType() != outputType)
+    return emitError("yield value in block does not match union return type");
 
   return success();
 }
@@ -375,20 +381,26 @@ LogicalResult LinalgReduceOp::verify() {
     return emitError("formula block must have 2 arguments");
 
   Type outputType = output().getType();
-  Operation &term = formula.back();
-  Value lastVal = term.getResult(0);
-  if (lastVal.getType() != outputType)
-    return emitError("final value in formula block must have same type as reduce return type");
+  LinalgYieldOp yield =
+      llvm::dyn_cast_or_null<LinalgYieldOp>(formula.getTerminator());
+  if (yield == nullptr)
+    return emitError("reduce block must end with sparse_tensor.linalg_yield");
+  Value retVal = yield.result();
+  if (retVal.getType() != outputType)
+    return emitError("yield value in formula block does not match reduce return type");
 
   Region &initRegion = init();
   Block &init = initRegion.front();
   if (init.getNumArguments() != 0)
     return emitError("init block must not have any arguments");
 
-  Operation &initTerm = init.back();
-  lastVal = initTerm.getResult(0);
-  if (lastVal.getType() != outputType)
-    return emitError("final value in init block must have same type as reduce return type");
+  LinalgYieldOp initYield =
+      llvm::dyn_cast_or_null<LinalgYieldOp>(init.getTerminator());
+  if (initYield == nullptr)
+    return emitError("init block must end with sparse_tensor.linalg_yield");
+  Value initVal = initYield.result();
+  if (initVal.getType() != outputType)
+    return emitError("yield value in init block does not match reduce return type");
 
   return success();
 }
@@ -400,10 +412,31 @@ LogicalResult LinalgApplyOp::verify() {
     return emitError("block must have 1 argument");
 
   Type outputType = output().getType();
-  Operation &term = formula.back();
-  Value lastVal = term.getResult(0);
-  if (lastVal.getType() != outputType)
-    return emitError("final value in block must have same type as apply return type");
+  LinalgYieldOp yield =
+      llvm::dyn_cast_or_null<LinalgYieldOp>(formula.getTerminator());
+  if (yield == nullptr)
+    return emitError("apply block must end with sparse_tensor.linalg_yield");
+
+  Value retVal = yield.result();
+  if (retVal.getType() != outputType)
+    return emitError("yield value in block does not match apply return type");
+
+  return success();
+}
+
+LogicalResult LinalgMaskOp::verify() {
+  // Result of block must be i1
+  Region &region = expr();
+  Block &block = region.front();
+  LinalgYieldOp yield =
+      llvm::dyn_cast_or_null<LinalgYieldOp>(block.getTerminator());
+  if (yield == nullptr)
+    return emitError("mask block must end with sparse_tensor.linalg_yield");
+
+  Type retType = yield.result().getType();
+  IntegerType iType = retType.dyn_cast<IntegerType>();
+  if (!iType || iType.getWidth() != 1)
+    return emitError("mask block must return i1 type");
 
   return success();
 }

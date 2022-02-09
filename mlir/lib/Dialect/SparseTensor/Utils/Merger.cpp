@@ -579,11 +579,12 @@ Value Merger::getIdentity(PatternRewriter &rewriter, Location loc, unsigned e, T
       sparse_tensor::LinalgReduceOp laop = llvm::dyn_cast_or_null<sparse_tensor::LinalgReduceOp>(origOp);
       Region &region = laop.init();
       Block &formula = region.front();
-      Operation &term = formula.back();
+      LinalgYieldOp yield = dyn_cast_or_null<LinalgYieldOp>(formula.getTerminator());
       Operation *placeholder = rewriter.create<arith::ConstantIndexOp>(loc, 0);
       rewriter.mergeBlockBefore(&formula, placeholder, {});
+      Value retVal = yield.result();
       rewriter.eraseOp(placeholder);
-      Value retVal = term.getResult(0);
+      rewriter.eraseOp(yield);
       return retVal;
     }
   default:
@@ -818,22 +819,24 @@ Value Merger::buildExp(PatternRewriter &rewriter, Location loc, unsigned e,
     return rewriter.create<arith::ShLIOp>(loc, v0, v1);
   case kApply:
     {
-      Operation *op = tensorExps[e].operation;
+      LinalgYieldOp yield = dyn_cast_or_null<LinalgYieldOp>(tensorExps[e].operation);
       Operation *placeholder = rewriter.create<arith::ConstantIndexOp>(loc, 0);
-      rewriter.mergeBlockBefore(op->getBlock(), placeholder, {v0});
+      rewriter.mergeBlockBefore(yield->getBlock(), placeholder, {v0});
+      Value retVal = yield.result();
       rewriter.eraseOp(placeholder);
-      Value retVal = op->getResult(0);
+      rewriter.eraseOp(yield);
       return retVal;
     }
   case kIntersect:
   case kUnion:
     {
       // Merge the formula block into the loop
-      Operation *op = tensorExps[e].operation;
+      LinalgYieldOp yield = dyn_cast_or_null<LinalgYieldOp>(tensorExps[e].operation);
       Operation *placeholder = rewriter.create<arith::ConstantIndexOp>(loc, 0);
-      rewriter.mergeBlockBefore(op->getBlock(), placeholder, {v0, v1});
+      rewriter.mergeBlockBefore(yield->getBlock(), placeholder, {v0, v1});
+      Value retVal = yield.result();
       rewriter.eraseOp(placeholder);
-      Value retVal = op->getResult(0);
+      rewriter.eraseOp(yield);
       return retVal;
     }
   case kReduce:
@@ -843,11 +846,12 @@ Value Merger::buildExp(PatternRewriter &rewriter, Location loc, unsigned e,
       sparse_tensor::LinalgReduceOp laop = llvm::dyn_cast_or_null<sparse_tensor::LinalgReduceOp>(origOp);
       Region &region = laop.formula();
       Block &formula = region.front();
-      Operation &term = formula.back();
+      LinalgYieldOp yield = dyn_cast_or_null<LinalgYieldOp>(formula.getTerminator());
       Operation *placeholder = rewriter.create<arith::ConstantIndexOp>(loc, 0);
       rewriter.mergeBlockBefore(&formula, placeholder, {v0, v1});
+      Value retVal = yield.result();
       rewriter.eraseOp(placeholder);
-      Value retVal = term.getResult(0);
+      rewriter.eraseOp(yield);
       return retVal;
     }
 

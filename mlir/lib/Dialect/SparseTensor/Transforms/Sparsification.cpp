@@ -56,7 +56,7 @@ struct CodeGen {
         idxs(numTensors, std::vector<Value>(numLoops)), redExp(-1u), redVal(), redValidLexInsert(),
         redKind(kNoReduc), sparseOut(op), outerParNest(nest), lexIdx(),
         expValues(), expFilled(), expAdded(), expCount(), curVecLength(1),
-        curVecMask() {}
+        curVecMask(), rank(), maskLoop() {}
   /// Sparsification options.
   SparsificationOptions options;
   /// Universal dense indices and upper bounds (by index). The loops array
@@ -96,6 +96,9 @@ struct CodeGen {
   // Current vector length and mask.
   unsigned curVecLength;
   Value curVecMask;
+  // Linalg mask variables
+  unsigned rank;
+  scf::IfOp maskLoop;
 };
 
 } // namespace
@@ -549,6 +552,7 @@ static void genBuffers(Merger &merger, CodeGen &codegen,
       auto dynShape = {ShapedType::kDynamicSize};
       auto memTp = MemRefType::get(dynShape, rewriter.getIndexType());
       codegen.lexIdx = rewriter.create<memref::AllocaOp>(loc, memTp, rank);
+      codegen.rank = op.getRank(t);
     } else {
       // Annotated sparse tensors.
       auto dynShape = {ShapedType::kDynamicSize};
@@ -1368,10 +1372,58 @@ static void genLocals(Merger &merger, CodeGen &codegen,
 
   // Move the insertion indices in lexicographic index order. During access
   // pattern expansion, we can skip setting the innermost dimension.
-  if (codegen.sparseOut && !codegen.expValues) {
-    Value pos = constantIndex(rewriter, loc, at);
-    rewriter.create<memref::StoreOp>(loc, codegen.loops[idx], codegen.lexIdx,
-                                     pos);
+  if (codegen.sparseOut) {
+    if (idx == codegen.rank - 1) {
+      // Handle linalg.mask
+      Block &block = op.region().front();
+      Operation &firstOp = block.front();
+      LinalgMaskOp maskOp = dyn_cast_or_null<LinalgMaskOp>(&firstOp);
+      if (maskOp != nullptr) {
+        Region &maskRegion = maskOp.expr();
+        Block &maskBlock = maskRegion.front();
+
+        unsigned numArgs = maskBlock.getNumArguments();
+        SmallVector<Value, 3> injectArgs;
+        assert(codegen.rank < 3 && "mask only supported for tensors of rank 1 or 2");
+        assert(numArgs > 0 && "mask block must have at least one argument");
+        if (codegen.rank == 2) {
+          injectArgs.push_back(codegen.loops[idx-1]);
+          if (numArgs >= 2)
+            injectArgs.push_back(codegen.loops[idx]);
+        } else {
+          injectArgs.push_back(codegen.loops[idx]);
+        }
+        if (numArgs > injectArgs.size()) {
+          // TODO: add the value
+          if (codegen.rank == 2)
+            assert(false && "mask with (row, col, val) not implemented yet");
+          else
+            assert(false && "mask with (index, val) not implemented yet");
+        }
+
+        LinalgYieldOp yield =
+            llvm::dyn_cast_or_null<LinalgYieldOp>(maskBlock.getTerminator());
+        Operation *placeholder = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+        rewriter.mergeBlockBefore(&maskBlock, placeholder, injectArgs);
+        Value maskCmp = yield.result();
+        rewriter.eraseOp(placeholder);
+        rewriter.eraseOp(yield);
+
+        if (codegen.expValues) {
+          TypeRange forRetType = maskCmp.getDefiningOp()->getParentOp()->getResultTypes();
+          codegen.maskLoop = rewriter.create<scf::IfOp>(loc, forRetType, maskCmp, true);
+        } else {
+          codegen.maskLoop = rewriter.create<scf::IfOp>(loc, maskCmp);
+        }
+        rewriter.setInsertionPointToStart(codegen.maskLoop.thenBlock());
+      }
+    }
+
+    if (!codegen.expValues) {
+      Value pos = constantIndex(rewriter, loc, at);
+      rewriter.create<memref::StoreOp>(loc, codegen.loops[idx], codegen.lexIdx,
+                                       pos);
+    }
   }
 }
 
@@ -1479,6 +1531,19 @@ static void genForInduction(Merger &merger, CodeGen &codegen,
   assert(o == operands.size());
   if (o > 0)
     rewriter.create<scf::YieldOp>(loc, operands);
+
+  if (codegen.maskLoop && codegen.maskLoop->getParentOp() == loop) {
+    if (o > 0) {
+      rewriter.setInsertionPointToStart(codegen.maskLoop.elseBlock());
+      scf::ForOp forLoop = dyn_cast_or_null<scf::ForOp>(loop);
+      rewriter.create<scf::YieldOp>(loc, forLoop.getLoopBody().getArgument(1));
+
+      rewriter.setInsertionPointAfter(codegen.maskLoop);
+      rewriter.create<scf::YieldOp>(loc, codegen.maskLoop.getResults());
+    }
+    rewriter.setInsertionPointAfter(codegen.maskLoop);
+  }
+
   rewriter.setInsertionPointAfter(loop);
 }
 
