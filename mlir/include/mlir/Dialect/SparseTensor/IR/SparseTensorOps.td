@@ -382,4 +382,179 @@ def SparseTensor_OutOp : SparseTensor_Op<"out", []>,
   let hasVerifier = 1;
 }
 
+//===----------------------------------------------------------------------===//
+// Sparse Tensor Custom Linalg.Generic Operations.
+//===----------------------------------------------------------------------===//
+
+def SparseTensor_LinalgIntersectOp : SparseTensor_Op<"linalg_intersect", [NoSideEffect, SameTypeOperands]> {
+  let summary = "Custom intersect operation within linalg.generic";
+  let description = [{
+      Custom intersect operation for use within `linalg.generic`.
+      The actual operation is held in a block for embedding by the sparse tensor dialect.
+      The final value in the block must be a sparse_tensor.linalg_yield.
+
+      Example:
+      ```mlir
+      %result = sparse_tensor.linalg_intersect %a, %b : f64 to i8 {
+        ^bb0(%v0: f64, %v1: f64):
+          %cmp = arith.cmpf "oeq", %v0, %v1 : f64
+          %ret_i8 = arith.extui %cmp : i1 to i8
+          sparse_tensor.linalg_yield %ret_i8 : i8
+      }
+      ```
+  }];
+
+  let arguments = (ins AnyType:$a, AnyType:$b);
+  let results = (outs AnyType:$output);
+  let regions = (region SizedRegion<1>:$formula);
+
+  let assemblyFormat = [{
+         $a `,` $b attr-dict `:` type($a) `to` type($output) $formula
+  }];
+  let hasVerifier = 1;
+}
+
+def SparseTensor_LinalgUnionOp : SparseTensor_Op<"linalg_union", [NoSideEffect, SameTypeOperands]> {
+  let summary = "Custom union operation within linalg.generic";
+  let description = [{
+      Custom union operation for use within `linalg.generic`.
+      The actual operation is held in a block for embedding by the sparse tensor dialect.
+      The final value in the block must be a sparse_tensor.linalg_yield.
+
+      Example:
+      ```mlir
+      %result = sparse_tensor.linalg_union %a, %b: f64 to f64 {
+        ^bb0(%v0: f64, %v1: f64):
+          %cmp = arith.cmpf "olt", %v0, %v1 : f64
+          %smaller = select %cmp, %v0, %v1 : f64
+          sparse_tensor.linalg_yield %smaller : f64
+      }
+      ```
+  }];
+
+  let arguments = (ins AnyType:$a, AnyType:$b);
+  let results = (outs AnyType:$output);
+  let regions = (region SizedRegion<1>:$formula);
+
+  let assemblyFormat = [{
+         $a `,` $b attr-dict `:` type($a) `to` type($output) $formula
+  }];
+  let hasVerifier = 1;
+}
+
+def SparseTensor_LinalgReduceOp : SparseTensor_Op<"linalg_reduce", [NoSideEffect, SameTypeOperands]> {
+  let summary = "Custom reduce operation within linalg.generic";
+  let description = [{
+      Custom reduce operation for use within `linalg.generic`.
+      The actual operation is held in a block for embedding by the sparse tensor dialect.
+      The final value in the formula block must be a sparse_tensor.linalg_yield.
+
+      A separate "init" block contains the starting value for the reduction.
+
+      Example:
+      ```mlir
+      %result = sparse_tensor.linalg_reduce %a, %b : f64 to f64 {
+        ^bb0(%v0: f64, %v1: f64):
+          %ret = arith.addf %v0, %v1 : f64
+          sparse_tensor.linalg_yield %ret : f64
+      } init {
+        %init = arith.constant 0.0 : f64
+        sparse_tensor.linalg_yield %init : f64
+      }
+      ```
+  }];
+
+  let arguments = (ins AnyType:$a, AnyType:$b);
+  let results = (outs AnyType:$output);
+  let regions = (region SizedRegion<1>:$formula, SizedRegion<1>:$init);
+
+  let assemblyFormat = [{
+         $a `,` $b attr-dict `:` type($a) `to` type($output) $formula `init` $init
+  }];
+  let hasVerifier = 1;
+}
+
+def SparseTensor_LinalgApplyOp : SparseTensor_Op<"linalg_apply", [NoSideEffect]> {
+  let summary = "Custom apply operation within linalg.generic";
+  let description = [{
+      Custom apply operation for use within `linalg.generic`.
+      The actual operation is held in a block for embedding by the sparse tensor dialect.
+      The final value in the formula block must be a sparse_tensor.linalg_yield.
+
+      Example:
+      ```
+      %result = sparse_tensor.linalg_apply %a : f64 to f64 {
+        ^bb0(%v0: f64):
+          %cf1 = arith.constant 1.0 : f64
+          %ret = arith.addf %v0, %cf1 : f64
+          sparse_tensor.linalg_yield %ret : f64
+      }
+      ```
+  }];
+
+  let arguments = (ins AnyType:$a);
+  let results = (outs AnyType:$output);
+  let regions = (region SizedRegion<1>:$formula);
+
+  let assemblyFormat = [{
+         $a attr-dict `:` type($a) `to` type($output) $formula
+  }];
+  let hasVerifier = 1;
+}
+
+def SparseTensor_LinalgMaskOp : SparseTensor_Op<"linalg_mask", []> {
+  let summary = "Mask operation within linalg.generic";
+  let description = [{
+      Custom mask operation for use within `linalg.generic`.
+      The mask operation must be the first operation in the linalg.generic block.
+
+      The final value in the mask block must be a sparse_tensor.linalg_yield
+      and must return a boolean (i1) result. If the return value is false,
+      the output will be masked (i.e. empty).
+      The meaning of each block argument depends on the rank of the linalg.generic output tensor.
+
+      Rank 1 (Vector)
+      - arg0 : index
+      - arg1 : value
+
+      Rank 2 (Matrix)
+      - arg0 : row
+      - arg1 : column
+      - arg2 : value
+
+      Example:
+      ```
+      sparse_tensor.linalg_mask {
+        ^bb0(%row: index, col%: index):
+          %triu = arith.cmpi "ugt", %col, %row : index
+          sparse_tensor.linalg_yield %triu : i1
+      }
+      ```
+  }];
+
+  let regions = (region SizedRegion<1>:$expr);
+
+  let assemblyFormat = [{
+         $expr attr-dict
+  }];
+  let hasVerifier = 1;
+}
+
+def SparseTensor_LinalgYieldOp : SparseTensor_Op<"linalg_yield", [Terminator]> {
+  let summary = "Yield from sparse_tensor.linalg_* methods";
+  let description = [{
+      Yield a value from within a custom block
+
+      Example:
+      ```
+      sparse_tensor.linalg_yield %result : f64
+      ```
+  }];
+
+  let arguments = (ins AnyType:$result);
+  let assemblyFormat = [{
+        $result attr-dict `:` type($result)
+  }];
+}
+
 #endif // SPARSETENSOR_OPS

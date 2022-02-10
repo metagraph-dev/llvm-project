@@ -335,6 +335,115 @@ LogicalResult OutOp::verify() {
 }
 
 //===----------------------------------------------------------------------===//
+// Sparse Tensor Custom Linalg.Generic Operations.
+//===----------------------------------------------------------------------===//
+
+LogicalResult LinalgIntersectOp::verify() {
+  Region &region = formula();
+  Block &formula = region.front();
+  if (formula.getNumArguments() != 2)
+    return emitError("block must have 2 arguments");
+
+  Type outputType = output().getType();
+  LinalgYieldOp yield =
+      llvm::dyn_cast_or_null<LinalgYieldOp>(formula.getTerminator());
+  if (yield == nullptr)
+    return emitError("intersect block must end with sparse_tensor.linalg_yield");
+  Value retVal = yield.result();
+  if (retVal.getType() != outputType)
+    return emitError("yield value in block does not match intersect return type");
+
+  return success();
+}
+
+LogicalResult LinalgUnionOp::verify() {
+  Region &region = formula();
+  Block &formula = region.front();
+  if (formula.getNumArguments() != 2)
+    return emitError("block must have 2 arguments");
+
+  Type outputType = output().getType();
+  LinalgYieldOp yield =
+      llvm::dyn_cast_or_null<LinalgYieldOp>(formula.getTerminator());
+  if (yield == nullptr)
+    return emitError("union block must end with sparse_tensor.linalg_yield");
+  Value retVal = yield.result();
+  if (retVal.getType() != outputType)
+    return emitError("yield value in block does not match union return type");
+
+  return success();
+}
+
+LogicalResult LinalgReduceOp::verify() {
+  Region &formulaRegion = formula();
+  Block &formula = formulaRegion.front();
+  if (formula.getNumArguments() != 2)
+    return emitError("formula block must have 2 arguments");
+
+  Type outputType = output().getType();
+  LinalgYieldOp yield =
+      llvm::dyn_cast_or_null<LinalgYieldOp>(formula.getTerminator());
+  if (yield == nullptr)
+    return emitError("reduce block must end with sparse_tensor.linalg_yield");
+  Value retVal = yield.result();
+  if (retVal.getType() != outputType)
+    return emitError("yield value in formula block does not match reduce return type");
+
+  Region &initRegion = init();
+  Block &init = initRegion.front();
+  if (init.getNumArguments() != 0)
+    return emitError("init block must not have any arguments");
+
+  LinalgYieldOp initYield =
+      llvm::dyn_cast_or_null<LinalgYieldOp>(init.getTerminator());
+  if (initYield == nullptr)
+    return emitError("init block must end with sparse_tensor.linalg_yield");
+  Value initVal = initYield.result();
+  if (initVal.getType() != outputType)
+    return emitError("yield value in init block does not match reduce return type");
+
+  return success();
+}
+
+LogicalResult LinalgApplyOp::verify() {
+  Region &region = formula();
+  Block &formula = region.front();
+  if (formula.getNumArguments() < 1)
+    return emitError("block must have at least 1 argument");
+  if (formula.getNumArguments() > 3)
+    return emitError("block must have no more than 3 arguments");
+
+  Type outputType = output().getType();
+  LinalgYieldOp yield =
+      llvm::dyn_cast_or_null<LinalgYieldOp>(formula.getTerminator());
+  if (yield == nullptr)
+    return emitError("apply block must end with sparse_tensor.linalg_yield");
+
+  Value retVal = yield.result();
+  if (retVal.getType() != outputType)
+    return emitError("yield value in block does not match apply return type");
+
+  return success();
+}
+
+LogicalResult LinalgMaskOp::verify() {
+  // Result of block must be i1
+  Region &region = expr();
+  Block &block = region.front();
+  LinalgYieldOp yield =
+      llvm::dyn_cast_or_null<LinalgYieldOp>(block.getTerminator());
+  if (yield == nullptr)
+    return emitError("mask block must end with sparse_tensor.linalg_yield");
+
+  Type retType = yield.result().getType();
+  IntegerType iType = retType.dyn_cast<IntegerType>();
+  if (!iType || iType.getWidth() != 1)
+    return emitError("mask block must return i1 type");
+
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
 // TensorDialect Methods.
 //===----------------------------------------------------------------------===//
 

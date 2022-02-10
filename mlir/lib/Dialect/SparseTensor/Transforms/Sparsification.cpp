@@ -42,7 +42,7 @@ namespace {
 enum SortMask { kSparseOnly = 0x0, kIncludeDense = 0x1, kIncludeUndef = 0x2 };
 
 // Reduction kinds.
-enum Reduction { kNoReduc, kSum, kProduct, kAnd, kOr, kXor };
+enum Reduction { kNoReduc, kSum, kProduct, kAnd, kOr, kXor, kCustom };
 
 // Code generation.
 struct CodeGen {
@@ -53,10 +53,10 @@ struct CodeGen {
         indices(numTensors, std::vector<Value>(numLoops)),
         highs(numTensors, std::vector<Value>(numLoops)),
         pidxs(numTensors, std::vector<Value>(numLoops)),
-        idxs(numTensors, std::vector<Value>(numLoops)), redExp(-1u), redVal(),
+        idxs(numTensors, std::vector<Value>(numLoops)), redExp(-1u), redVal(), redValidLexInsert(),
         redKind(kNoReduc), sparseOut(op), outerParNest(nest), lexIdx(),
         expValues(), expFilled(), expAdded(), expCount(), curVecLength(1),
-        curVecMask() {}
+        curVecMask(), rank(), maskLoop(), maskYield() {}
   /// Sparsification options.
   SparsificationOptions options;
   /// Universal dense indices and upper bounds (by index). The loops array
@@ -80,6 +80,7 @@ struct CodeGen {
   /// reduction are exhausted, all inner loops can use a scalarized reduction.
   unsigned redExp;
   Value redVal;
+  Value redValidLexInsert;
   Reduction redKind;
   // Sparse tensor as output. Implemented either through direct injective
   // insertion in lexicographic index order (where indices are updated
@@ -95,6 +96,10 @@ struct CodeGen {
   // Current vector length and mask.
   unsigned curVecLength;
   Value curVecMask;
+  // Linalg mask variables
+  unsigned rank;
+  scf::IfOp maskLoop;
+  LinalgYieldOp maskYield;
 };
 
 } // namespace
@@ -369,6 +374,8 @@ static StringRef getReductionName(Reduction kind) {
     return "or";
   case kXor:
     return "xor";
+  case kCustom:
+    return "custom";
   }
   llvm_unreachable("unknown reduction kind");
 }
@@ -390,6 +397,8 @@ static Reduction getReduction(Kind kind) {
     return kOr;
   case Kind::kXorI:
     return kXor;
+  case Kind::kReduce:
+    return kCustom;
   default:
     llvm_unreachable("unexpected reduction operator");
   }
@@ -404,6 +413,7 @@ static Value genVectorReducInit(CodeGen &codegen, PatternRewriter &rewriter,
   Value r = codegen.redVal;
   switch (codegen.redKind) {
   case kNoReduc:
+  case kCustom:
     break;
   case kSum:
   case kXor:
@@ -434,9 +444,10 @@ static Value genVectorReducEnd(CodeGen &codegen, PatternRewriter &rewriter,
 }
 
 /// Updates scalarized reduction value.
-static void updateReduc(Merger &merger, CodeGen &codegen, Value reduc) {
+static void updateReduc(Merger &merger, CodeGen &codegen, Value reduc, Value validLexInsert = Value()) {
   assert(codegen.redKind != kNoReduc);
   codegen.redVal = merger.exp(codegen.redExp).val = reduc;
+  codegen.redValidLexInsert = validLexInsert;
 }
 
 //===----------------------------------------------------------------------===//
@@ -542,6 +553,7 @@ static void genBuffers(Merger &merger, CodeGen &codegen,
       auto dynShape = {ShapedType::kDynamicSize};
       auto memTp = MemRefType::get(dynShape, rewriter.getIndexType());
       codegen.lexIdx = rewriter.create<memref::AllocaOp>(loc, memTp, rank);
+      codegen.rank = op.getRank(t);
     } else {
       // Annotated sparse tensors.
       auto dynShape = {ShapedType::kDynamicSize};
@@ -702,26 +714,51 @@ static Value genSubscript(CodeGen &codegen, PatternRewriter &rewriter,
 }
 
 /// Generates insertion code to implement dynamic tensor load.
-static Value genInsertionLoad(CodeGen &codegen, PatternRewriter &rewriter,
+static Value genInsertionLoad(Merger &merger, CodeGen &codegen, PatternRewriter &rewriter,
                               linalg::GenericOp op, OpOperand *t) {
   Location loc = op.getLoc();
+  Type tp = getElementTypeOrSelf(t->get().getType());
   // Direct lexicographic index order, tensor loads as zero.
   if (!codegen.expValues) {
-    Type tp = getElementTypeOrSelf(t->get().getType());
-    return constantZero(rewriter, loc, tp);
+    if (codegen.redKind == kNoReduc)
+      return constantZero(rewriter, loc, tp);
+    else
+      return merger.getIdentity(rewriter, loc, codegen.redExp, tp);
   }
   // Load from expanded access pattern.
   Value index = genIndex(codegen, op, t);
-  return rewriter.create<memref::LoadOp>(loc, codegen.expValues, index);
+  if (codegen.redKind == kNoReduc)
+    return rewriter.create<memref::LoadOp>(loc, codegen.expValues, index);
+  // Value may be filled; if not, use the reduction init value
+  Value isFilled = rewriter.create<memref::LoadOp>(loc, codegen.expFilled, index);
+  scf::IfOp if_isFilled = rewriter.create<scf::IfOp>(loc, tp, isFilled, /*else=*/true);
+  // True branch
+  rewriter.setInsertionPointToStart(if_isFilled.thenBlock());
+  Value valAtIndex = rewriter.create<memref::LoadOp>(loc, codegen.expValues, index);
+  rewriter.create<scf::YieldOp>(loc, valAtIndex);
+  // False branch
+  rewriter.setInsertionPointToStart(if_isFilled.elseBlock());
+  Value initVal = merger.getIdentity(rewriter, loc, codegen.redExp, tp);
+  rewriter.create<scf::YieldOp>(loc, initVal);
+  rewriter.setInsertionPointAfter(if_isFilled);
+  // End if
+  return if_isFilled.getResult(0);
 }
 
 /// Generates insertion code to implement dynamic tensor store.
 static void genInsertionStore(CodeGen &codegen, PatternRewriter &rewriter,
-                              linalg::GenericOp op, OpOperand *t, Value rhs) {
+                              linalg::GenericOp op, OpOperand *t, Value rhs, Value validLexInsert) {
   Location loc = op.getLoc();
   // Direct insertion in lexicographic index order.
   if (!codegen.expValues) {
-    rewriter.create<LexInsertOp>(loc, t->get(), codegen.lexIdx, rhs);
+    if (!validLexInsert)
+      rewriter.create<LexInsertOp>(loc, t->get(), codegen.lexIdx, rhs);
+    else {
+      scf::IfOp ifValidLexInsert = rewriter.create<scf::IfOp>(loc, validLexInsert);
+      rewriter.setInsertionPointToStart(ifValidLexInsert.thenBlock());
+      rewriter.create<LexInsertOp>(loc, t->get(), codegen.lexIdx, rhs);
+      rewriter.setInsertionPointAfter(ifValidLexInsert);
+    }
     return;
   }
   // Generates insertion code along expanded access pattern.
@@ -770,7 +807,7 @@ static Value genTensorLoad(Merger &merger, CodeGen &codegen,
   // Load during insertion.
   OpOperand *t = op.getInputAndOutputOperands()[merger.exp(exp).tensor];
   if (t == codegen.sparseOut)
-    return genInsertionLoad(codegen, rewriter, op, t);
+    return genInsertionLoad(merger, codegen, rewriter, op, t);
   // Actual load.
   SmallVector<Value, 4> args;
   Value ptr = genSubscript(codegen, rewriter, op, t, args);
@@ -782,20 +819,20 @@ static Value genTensorLoad(Merger &merger, CodeGen &codegen,
 /// Generates a store on a dense or sparse tensor.
 static void genTensorStore(Merger &merger, CodeGen &codegen,
                            PatternRewriter &rewriter, linalg::GenericOp op,
-                           Value rhs) {
+                           Value rhs, Value validLexInsert) {
   Location loc = op.getLoc();
   // Test if this is a scalarized reduction.
   if (codegen.redVal) {
     if (codegen.curVecLength > 1)
       rhs = rewriter.create<arith::SelectOp>(loc, codegen.curVecMask, rhs,
                                              codegen.redVal);
-    updateReduc(merger, codegen, rhs);
+    updateReduc(merger, codegen, rhs, validLexInsert);
     return;
   }
   // Store during insertion.
   OpOperand *t = op.getOutputOperand(0);
   if (t == codegen.sparseOut) {
-    genInsertionStore(codegen, rewriter, op, t, rhs);
+    genInsertionStore(codegen, rewriter, op, t, rhs, validLexInsert);
     return;
   }
   // Actual store.
@@ -874,19 +911,59 @@ static Value genAddress(CodeGen &codegen, PatternRewriter &rewriter,
   return rewriter.create<arith::AddIOp>(loc, mul, i);
 }
 
+/// Generates the mask if-statement.
+static void genMaskLoop(CodeGen &codegen, PatternRewriter &rewriter,
+                        LinalgYieldOp op, SmallVector<Value, 3> injectArgs) {
+    Location loc = op.getLoc();
+    Operation *placeholder = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+    rewriter.mergeBlockBefore(op->getBlock(), placeholder, injectArgs);
+    Value maskCmp = op.result();
+    rewriter.eraseOp(placeholder);
+    rewriter.eraseOp(op);
+
+    if (codegen.expValues) {
+      TypeRange forRetType = maskCmp.getDefiningOp()->getParentOp()->getResultTypes();
+      codegen.maskLoop = rewriter.create<scf::IfOp>(loc, forRetType, maskCmp, true);
+    } else {
+      codegen.maskLoop = rewriter.create<scf::IfOp>(loc, maskCmp);
+    }
+    rewriter.setInsertionPointToStart(codegen.maskLoop.thenBlock());
+}
+
 /// Recursively generates tensor expression.
 static Value genExp(Merger &merger, CodeGen &codegen, PatternRewriter &rewriter,
-                    linalg::GenericOp op, unsigned exp) {
+                    linalg::GenericOp op, unsigned exp, unsigned last = 0) {
   Location loc = op.getLoc();
   if (exp == -1u)
     return Value();
-  if (merger.exp(exp).kind == Kind::kTensor)
-    return genTensorLoad(merger, codegen, rewriter, op, exp);
+  if (merger.exp(exp).kind == Kind::kTensor) {
+    OpOperand *t = op.getInputAndOutputOperands()[merger.exp(exp).tensor];
+    OpOperand *lhs = op.getOutputOperand(0);
+    if (lhs == t) {
+      codegen.redKind = getReduction(merger.exp(last).kind);
+      codegen.redExp = last;
+    }
+    Value redVal = genTensorLoad(merger, codegen, rewriter, op, exp);
+    if (lhs == t)
+      codegen.redExp = exp;
+    return redVal;
+  }
   if (merger.exp(exp).kind == Kind::kInvariant)
     return genInvariantValue(merger, codegen, rewriter, exp);
-  Value v0 = genExp(merger, codegen, rewriter, op, merger.exp(exp).children.e0);
-  Value v1 = genExp(merger, codegen, rewriter, op, merger.exp(exp).children.e1);
-  return merger.buildExp(rewriter, loc, exp, v0, v1);
+  Value v0 = genExp(merger, codegen, rewriter, op, merger.exp(exp).children.e0, exp);
+  Value v1 = genExp(merger, codegen, rewriter, op, merger.exp(exp).children.e1, exp);
+
+  if (codegen.maskYield) {
+    // Masking based on value must be handled here
+    SmallVector<Value, 3> injectArgs;
+    injectArgs.push_back(codegen.loops[0]);
+    if (codegen.rank == 2)
+      injectArgs.push_back(codegen.loops[1]);
+    injectArgs.push_back(v0);
+    genMaskLoop(codegen, rewriter, codegen.maskYield, injectArgs);
+  }
+
+  return merger.buildExp(rewriter, loc, exp, v0, v1, codegen.loops);
 }
 
 /// Determines if affine expression is invariant.
@@ -914,7 +991,7 @@ static bool isInvariantAffine(const CodeGen &codegen, AffineExpr a,
 static void genInvariants(Merger &merger, CodeGen &codegen,
                           PatternRewriter &rewriter, linalg::GenericOp op,
                           unsigned exp, unsigned ldx, bool atStart,
-                          Kind last = Kind::kTensor) {
+                          unsigned last = 0) {
   if (exp == -1u)
     return;
   if (merger.exp(exp).kind == Kind::kTensor) {
@@ -935,16 +1012,19 @@ static void genInvariants(Merger &merger, CodeGen &codegen,
     if (lhs == t) {
       // Start or end a scalarized reduction
       if (atStart) {
+        codegen.redKind = getReduction(merger.exp(last).kind);
+        codegen.redExp = last; // this allows for custom reduction initialization
         Value load = genTensorLoad(merger, codegen, rewriter, op, exp);
-        codegen.redKind = getReduction(last);
-        codegen.redExp = exp;
+        codegen.redExp = exp; // this ties the initial reduction to the output tensor
         updateReduc(merger, codegen, load);
+
       } else {
         Value redVal = codegen.redVal;
-        updateReduc(merger, codegen, Value());
+        Value redValidLexInsert = codegen.redValidLexInsert;
+        updateReduc(merger, codegen, Value(), Value());
         codegen.redExp = -1u;
         codegen.redKind = kNoReduc;
-        genTensorStore(merger, codegen, rewriter, op, redVal);
+        genTensorStore(merger, codegen, rewriter, op, redVal, redValidLexInsert);
       }
     } else {
       // Start or end loop invariant hoisting of a tensor load.
@@ -955,11 +1035,10 @@ static void genInvariants(Merger &merger, CodeGen &codegen,
     // Traverse into the binary operations. Note that we only hoist
     // tensor loads, since subsequent MLIR/LLVM passes know how to
     // deal with all other kinds of derived loop invariants.
-    Kind last = merger.exp(exp).kind;
     unsigned e0 = merger.exp(exp).children.e0;
     unsigned e1 = merger.exp(exp).children.e1;
-    genInvariants(merger, codegen, rewriter, op, e0, ldx, atStart, last);
-    genInvariants(merger, codegen, rewriter, op, e1, ldx, atStart, last);
+    genInvariants(merger, codegen, rewriter, op, e0, ldx, atStart, exp);
+    genInvariants(merger, codegen, rewriter, op, e1, ldx, atStart, exp);
   }
 }
 
@@ -1179,6 +1258,7 @@ static Operation *genWhile(Merger &merger, CodeGen &codegen,
   SmallVector<Type, 4> types;
   SmallVector<Value, 4> operands;
   // Construct the while-loop with a parameter for each index.
+  Location loc = op.getLoc();
   Type indexType = rewriter.getIndexType();
   for (unsigned b = 0, be = indices.size(); b < be; b++) {
     if (indices[b] && merger.isDim(b, Dim::kSparse)) {
@@ -1191,6 +1271,12 @@ static Operation *genWhile(Merger &merger, CodeGen &codegen,
   if (codegen.redVal) {
     types.push_back(codegen.redVal.getType());
     operands.push_back(codegen.redVal);
+    if (codegen.sparseOut) {
+      Type boolType = rewriter.getIntegerType(1);
+      Value falseval = rewriter.create<arith::ConstantIntOp>(loc, 0, boolType);
+      types.push_back(boolType);
+      operands.push_back(falseval);
+    }
   }
   if (codegen.expValues) {
     types.push_back(indexType);
@@ -1201,7 +1287,6 @@ static Operation *genWhile(Merger &merger, CodeGen &codegen,
     operands.push_back(codegen.loops[idx]);
   }
   assert(types.size() == operands.size());
-  Location loc = op.getLoc();
   scf::WhileOp whileOp = rewriter.create<scf::WhileOp>(loc, types, operands);
 
   SmallVector<Location> locs(types.size(), loc);
@@ -1225,8 +1310,15 @@ static Operation *genWhile(Merger &merger, CodeGen &codegen,
       codegen.pidxs[tensor][idx] = after->getArgument(o++);
     }
   }
-  if (codegen.redVal)
-    updateReduc(merger, codegen, after->getArgument(o++));
+  if (codegen.redVal) {
+    if (codegen.sparseOut) {
+      BlockArgument valArg = after->getArgument(o++);
+      BlockArgument validLexArg = after->getArgument(o++);
+      updateReduc(merger, codegen, valArg, validLexArg);
+    } else {
+      updateReduc(merger, codegen, after->getArgument(o++));
+    }
+  }
   if (codegen.expValues)
     codegen.expCount = after->getArgument(o++);
   if (needsUniv)
@@ -1311,10 +1403,39 @@ static void genLocals(Merger &merger, CodeGen &codegen,
 
   // Move the insertion indices in lexicographic index order. During access
   // pattern expansion, we can skip setting the innermost dimension.
-  if (codegen.sparseOut && !codegen.expValues) {
-    Value pos = constantIndex(rewriter, loc, at);
-    rewriter.create<memref::StoreOp>(loc, codegen.loops[idx], codegen.lexIdx,
-                                     pos);
+  if (codegen.sparseOut) {
+    if (idx == codegen.rank - 1) {
+      // Handle linalg_mask
+      Block &block = op.region().front();
+      Operation &firstOp = block.front();
+      LinalgMaskOp maskOp = dyn_cast_or_null<LinalgMaskOp>(&firstOp);
+      if (maskOp != nullptr) {
+        assert(codegen.rank <= 2 && "mask only supported for tensors of rank 1 or 2");
+        Region &maskRegion = maskOp.expr();
+        Block &maskBlock = maskRegion.front();
+        LinalgYieldOp yield = llvm::dyn_cast_or_null<LinalgYieldOp>(maskBlock.getTerminator());
+
+        unsigned numArgs = maskBlock.getNumArguments();
+        assert(numArgs > 0 && "mask block must have at least one argument");
+        if (numArgs <= codegen.rank) {
+          SmallVector<Value, 3> injectArgs;
+          injectArgs.push_back(codegen.loops[0]);
+          if (codegen.rank == 2)
+            injectArgs.push_back(codegen.loops[1]);
+
+          genMaskLoop(codegen, rewriter, yield, injectArgs);
+        } else {
+          // Save for when value is available
+          codegen.maskYield = yield;
+        }
+      }
+    }
+
+    if (!codegen.expValues) {
+      Value pos = constantIndex(rewriter, loc, at);
+      rewriter.create<memref::StoreOp>(loc, codegen.loops[idx], codegen.lexIdx,
+                                       pos);
+    }
   }
 }
 
@@ -1333,7 +1454,13 @@ static void genWhileInduction(Merger &merger, CodeGen &codegen,
       SmallVector<Value, 4> yields;
       if (codegen.redVal) {
         yields.push_back(codegen.redVal);
-        updateReduc(merger, codegen, ifOp.getResult(y++));
+        Value valArg = ifOp.getResult(y++);
+        if (codegen.redValidLexInsert) {
+          yields.push_back(codegen.redValidLexInsert);
+          Value validLexArg = ifOp.getResult(y++);
+          updateReduc(merger, codegen, valArg, validLexArg);
+        } else
+          updateReduc(merger, codegen, valArg);
       }
       if (codegen.expValues) {
         yields.push_back(codegen.expCount);
@@ -1369,7 +1496,14 @@ static void genWhileInduction(Merger &merger, CodeGen &codegen,
   }
   if (codegen.redVal) {
     operands.push_back(codegen.redVal);
-    updateReduc(merger, codegen, whileOp->getResult(o++));
+    OpResult valArg = whileOp->getResult(o++);
+    if (codegen.redValidLexInsert) {
+      operands.push_back(codegen.redValidLexInsert);
+      OpResult validLexArg = whileOp->getResult(o++);
+      updateReduc(merger, codegen, valArg, validLexArg);
+    } else {
+      updateReduc(merger, codegen, valArg);
+    }
   }
   if (codegen.expValues) {
     operands.push_back(codegen.expCount);
@@ -1394,7 +1528,13 @@ static void genForInduction(Merger &merger, CodeGen &codegen,
   SmallVector<Value, 4> operands;
   if (codegen.redVal) {
     operands.push_back(codegen.redVal);
-    updateReduc(merger, codegen, loop->getResult(o++));
+    OpResult valArg = loop->getResult(o++);
+    if (codegen.redValidLexInsert) {
+      operands.push_back(codegen.redValidLexInsert);
+      OpResult validLexArg = loop->getResult(o++);
+      updateReduc(merger, codegen, valArg, validLexArg);
+    } else
+      updateReduc(merger, codegen, valArg);
   }
   if (codegen.expValues) {
     operands.push_back(codegen.expCount);
@@ -1403,6 +1543,19 @@ static void genForInduction(Merger &merger, CodeGen &codegen,
   assert(o == operands.size());
   if (o > 0)
     rewriter.create<scf::YieldOp>(loc, operands);
+
+  if (codegen.maskLoop && codegen.maskLoop->getParentOp() == loop) {
+    if (o > 0) {
+      rewriter.setInsertionPointToStart(codegen.maskLoop.elseBlock());
+      scf::ForOp forLoop = dyn_cast_or_null<scf::ForOp>(loop);
+      rewriter.create<scf::YieldOp>(loc, forLoop.getLoopBody().getArgument(1));
+
+      rewriter.setInsertionPointAfter(codegen.maskLoop);
+      rewriter.create<scf::YieldOp>(loc, codegen.maskLoop.getResults());
+    }
+    rewriter.setInsertionPointAfter(codegen.maskLoop);
+  }
+
   rewriter.setInsertionPointAfter(loop);
 }
 
@@ -1429,8 +1582,11 @@ static scf::IfOp genIf(Merger &merger, CodeGen &codegen,
       cond = cond ? rewriter.create<arith::AndIOp>(loc, cond, clause) : clause;
     }
   }
-  if (codegen.redVal)
+  if (codegen.redVal) {
     types.push_back(codegen.redVal.getType());
+    if (codegen.sparseOut)
+      types.push_back(codegen.redValidLexInsert.getType());
+  }
   if (codegen.expValues)
     types.push_back(rewriter.getIndexType());
   scf::IfOp ifOp = rewriter.create<scf::IfOp>(loc, types, cond, /*else=*/true);
@@ -1441,11 +1597,13 @@ static scf::IfOp genIf(Merger &merger, CodeGen &codegen,
 /// Generates end of true branch of if-statement within a while-loop.
 static void endIf(Merger &merger, CodeGen &codegen, PatternRewriter &rewriter,
                   linalg::GenericOp op, scf::IfOp ifOp, Operation *loop,
-                  Value redInput, Value cntInput) {
+                  Value redInput, Value redValidLexInsert, Value cntInput) {
   SmallVector<Value, 4> operands;
   if (codegen.redVal) {
     operands.push_back(codegen.redVal);
-    updateReduc(merger, codegen, redInput);
+    if (codegen.redValidLexInsert)
+      operands.push_back(codegen.redValidLexInsert);
+    updateReduc(merger, codegen, redInput, redValidLexInsert);
   }
   if (codegen.expValues) {
     operands.push_back(codegen.expCount);
@@ -1547,7 +1705,15 @@ static void genStmt(Merger &merger, CodeGen &codegen, PatternRewriter &rewriter,
   // At each leaf, assign remaining tensor (sub)expression to output tensor.
   if (at == topSort.size()) {
     Value rhs = genExp(merger, codegen, rewriter, op, exp);
-    genTensorStore(merger, codegen, rewriter, op, rhs);
+    Value validLexInsert;
+    if (codegen.redValidLexInsert) {
+      Location loc = op.getLoc();
+      Type boolType = rewriter.getIntegerType(1);
+      validLexInsert = rewriter.create<arith::ConstantIntOp>(loc, 1, boolType);
+    } else {
+      validLexInsert = Value();
+    }
+    genTensorStore(merger, codegen, rewriter, op, rhs, validLexInsert);
     return;
   }
 
@@ -1571,6 +1737,7 @@ static void genStmt(Merger &merger, CodeGen &codegen, PatternRewriter &rewriter,
     // Visit all lattices points with Li >= Lj to generate the
     // loop-body, possibly with if statements for coiteration.
     Value redInput = codegen.redVal;
+    Value redValidLexInsert = codegen.redValidLexInsert;
     Value cntInput = codegen.expCount;
     bool isWhile = dyn_cast<scf::WhileOp>(loop) != nullptr;
     for (unsigned j = 0; j < lsize; j++) {
@@ -1582,7 +1749,7 @@ static void genStmt(Merger &merger, CodeGen &codegen, PatternRewriter &rewriter,
           scf::IfOp ifOp =
               genIf(merger, codegen, rewriter, op, idx, merger.lat(lj).simple);
           genStmt(merger, codegen, rewriter, op, topSort, ej, at + 1);
-          endIf(merger, codegen, rewriter, op, ifOp, loop, redInput, cntInput);
+          endIf(merger, codegen, rewriter, op, ifOp, loop, redInput, redValidLexInsert, cntInput);
         } else {
           genStmt(merger, codegen, rewriter, op, topSort, ej, at + 1);
         }

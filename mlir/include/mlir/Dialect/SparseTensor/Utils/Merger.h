@@ -44,6 +44,8 @@ enum Kind {
   kCastU,  // unsigned
   kTruncI,
   kBitCast,
+  // Custom unary
+  kApply,
   // Binary operations.
   kMulF,
   kMulI,
@@ -60,6 +62,10 @@ enum Kind {
   kShrS, // signed
   kShrU, // unsigned
   kShlI,
+  // Custom binary
+  kIntersect,
+  kUnion,
+  kReduce,
 };
 
 /// Children subexpressions of tensor operations.
@@ -70,7 +76,7 @@ struct Children {
 
 /// Tensor expression. Represents a MLIR expression in tensor index notation.
 struct TensorExp {
-  TensorExp(Kind k, unsigned x, unsigned y, Value v);
+  TensorExp(Kind k, unsigned x, unsigned y, Value v, Operation *op);
 
   /// Tensor expression kind.
   Kind kind;
@@ -87,6 +93,8 @@ struct TensorExp {
   /// infer destination type) of a cast operation During code generation,
   /// this field may be used to cache "hoisted" loop invariant tensor loads.
   Value val;
+
+  Operation *operation;
 };
 
 /// Lattice point. Each lattice point consists of a conjunction of tensor
@@ -125,9 +133,9 @@ public:
         hasSparseOut(false), dims(t + 1, std::vector<Dim>(l, Dim::kUndef)) {}
 
   /// Adds a tensor expression. Returns its index.
-  unsigned addExp(Kind k, unsigned e0, unsigned e1 = -1u, Value v = Value());
-  unsigned addExp(Kind k, unsigned e, Value v) { return addExp(k, e, -1u, v); }
-  unsigned addExp(Kind k, Value v) { return addExp(k, -1u, -1u, v); }
+  unsigned addExp(Kind k, unsigned e0, unsigned e1 = -1u, Value v = Value(), Operation *op = nullptr);
+  unsigned addExp(Kind k, unsigned e, Value v, Operation *op = nullptr) { return addExp(k, e, -1u, v, op); }
+  unsigned addExp(Kind k, Value v, Operation *op = nullptr) { return addExp(k, -1u, -1u, v, op); }
 
   /// Adds an iteration lattice point. Returns its index.
   unsigned addLat(unsigned t, unsigned i, unsigned e);
@@ -139,20 +147,20 @@ public:
   /// of loop indices (effectively constructing a larger "intersection" of those
   /// indices) with a newly constructed tensor (sub)expression of given kind.
   /// Returns the index of the new lattice point.
-  unsigned conjLatPoint(Kind kind, unsigned p0, unsigned p1);
+  unsigned conjLatPoint(Kind kind, unsigned p0, unsigned p1, Operation *op = nullptr);
 
   /// Conjunctive merge of two lattice sets L0 and L1 is conjunction of
   /// cartesian product. Returns the index of the new set.
-  unsigned takeConj(Kind kind, unsigned s0, unsigned s1);
+  unsigned takeConj(Kind kind, unsigned s0, unsigned s1, Operation *op = nullptr);
 
   /// Disjunctive merge of two lattice sets L0 and L1 is (L0 /\_op L1, L0, L1).
   /// Returns the index of the new set.
-  unsigned takeDisj(Kind kind, unsigned s0, unsigned s1);
+  unsigned takeDisj(Kind kind, unsigned s0, unsigned s1, Operation *op = nullptr);
 
   /// Maps the unary operator over the lattice set of the operand, i.e. each
   /// lattice point on an expression E is simply copied over, but with OP E
   /// as new expression. Returns the index of the new set.
-  unsigned mapSet(Kind kind, unsigned s0, Value v = Value());
+  unsigned mapSet(Kind kind, unsigned s0, Value v = Value(), Operation *op = nullptr);
 
   /// Optimizes the iteration lattice points in the given set. This
   /// method should be called right before code generation to avoid
@@ -225,13 +233,18 @@ public:
   /// Returns index of the root expression.
   unsigned buildLattices(unsigned e, unsigned i);
 
+  /// Returns the identity value (i.e. x op identity == x)
+  /// This value is used in reductions as the initial value, meant to have
+  /// no impact on the final reduction value.
+  Value getIdentity(PatternRewriter &rewriter, Location loc, unsigned e, Type tp);
+
   /// Builds a tensor expression from the given Linalg operation.
   /// Returns index of the root expression on success.
   Optional<unsigned> buildTensorExpFromLinalg(linalg::GenericOp op);
 
   /// Rebuilds SSA format from a tensor expression.
   Value buildExp(PatternRewriter &rewriter, Location loc, unsigned e, Value v0,
-                 Value v1);
+                 Value v1, std::vector<Value> idxs);
 
 private:
   /// Private helpers.

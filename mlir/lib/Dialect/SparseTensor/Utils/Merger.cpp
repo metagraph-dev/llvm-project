@@ -8,6 +8,7 @@
 
 #include "mlir/Dialect/SparseTensor/Utils/Merger.h"
 #include "mlir/Dialect/Arithmetic/IR/Arithmetic.h"
+#include "mlir/Dialect/SparseTensor/IR/SparseTensor.h"
 
 #include "mlir/IR/Operation.h"
 #include "llvm/Support/Debug.h"
@@ -19,8 +20,8 @@ namespace sparse_tensor {
 // Constructors.
 //===----------------------------------------------------------------------===//
 
-TensorExp::TensorExp(Kind k, unsigned x, unsigned y, Value v)
-    : kind(k), val(v) {
+TensorExp::TensorExp(Kind k, unsigned x, unsigned y, Value v, Operation *op)
+    : kind(k), val(v), operation(op) {
   switch (kind) {
   case kTensor:
     assert(x != -1u && y == -1u && !v);
@@ -52,6 +53,18 @@ TensorExp::TensorExp(Kind k, unsigned x, unsigned y, Value v)
     children.e0 = x;
     children.e1 = y;
     break;
+  case kApply:
+    assert(x != -1u && y == -1u && op);
+    children.e0 = x;
+    children.e1 = y;
+    break;
+  case kIntersect:
+  case kUnion:
+  case kReduce:
+    assert(x != -1u && y != -1u && op);
+    children.e0 = x;
+    children.e1 = y;
+    break;
   default:
     assert(x != -1u && y != -1u && !v);
     children.e0 = x;
@@ -72,9 +85,9 @@ LatPoint::LatPoint(const BitVector &b, unsigned e)
 // Lattice methods.
 //===----------------------------------------------------------------------===//
 
-unsigned Merger::addExp(Kind k, unsigned e0, unsigned e1, Value v) {
+unsigned Merger::addExp(Kind k, unsigned e0, unsigned e1, Value v, Operation *op) {
   unsigned e = tensorExps.size();
-  tensorExps.push_back(TensorExp(k, e0, e1, v));
+  tensorExps.push_back(TensorExp(k, e0, e1, v, op));
   return e;
 }
 
@@ -91,25 +104,25 @@ unsigned Merger::addSet() {
   return s;
 }
 
-unsigned Merger::conjLatPoint(Kind kind, unsigned p0, unsigned p1) {
+unsigned Merger::conjLatPoint(Kind kind, unsigned p0, unsigned p1, Operation *op) {
   unsigned p = latPoints.size();
   BitVector nb = BitVector(latPoints[p0].bits);
   nb |= latPoints[p1].bits;
-  unsigned e = addExp(kind, latPoints[p0].exp, latPoints[p1].exp);
+  unsigned e = addExp(kind, latPoints[p0].exp, latPoints[p1].exp, Value(), op);
   latPoints.push_back(LatPoint(nb, e));
   return p;
 }
 
-unsigned Merger::takeConj(Kind kind, unsigned s0, unsigned s1) {
+unsigned Merger::takeConj(Kind kind, unsigned s0, unsigned s1, Operation *op) {
   unsigned s = addSet();
   for (unsigned p0 : latSets[s0])
     for (unsigned p1 : latSets[s1])
-      latSets[s].push_back(conjLatPoint(kind, p0, p1));
+      latSets[s].push_back(conjLatPoint(kind, p0, p1, op));
   return s;
 }
 
-unsigned Merger::takeDisj(Kind kind, unsigned s0, unsigned s1) {
-  unsigned s = takeConj(kind, s0, s1);
+unsigned Merger::takeDisj(Kind kind, unsigned s0, unsigned s1, Operation *op) {
+  unsigned s = takeConj(kind, s0, s1, op);
   // Followed by all in s0.
   for (unsigned p : latSets[s0])
     latSets[s].push_back(p);
@@ -124,11 +137,11 @@ unsigned Merger::takeDisj(Kind kind, unsigned s0, unsigned s1) {
   return s;
 }
 
-unsigned Merger::mapSet(Kind kind, unsigned s0, Value v) {
-  assert(kAbsF <= kind && kind <= kBitCast);
+unsigned Merger::mapSet(Kind kind, unsigned s0, Value v, Operation *op) {
+  assert(kAbsF <= kind && kind <= kApply);
   unsigned s = addSet();
   for (unsigned p : latSets[s0]) {
-    unsigned e = addExp(kind, latPoints[p].exp, v);
+    unsigned e = addExp(kind, latPoints[p].exp, v, op);
     latPoints.push_back(LatPoint(latPoints[p].bits, e));
     latSets[s].push_back(latPoints.size() - 1);
   }
@@ -324,6 +337,14 @@ static const char *kindToOpSymbol(Kind kind) {
     return ">>";
   case kShlI:
     return "<<";
+  case kApply:
+    return "CustomLinalgApply";
+  case kIntersect:
+    return "CustomLinalgIntersect";
+  case kUnion:
+    return "CustomLinalgUnion";
+  case kReduce:
+    return "CustomLinalgReduce";
   }
   llvm_unreachable("unexpected kind for symbol");
 }
@@ -515,8 +536,60 @@ unsigned Merger::buildLattices(unsigned e, unsigned i) {
     return takeConj(kind, // take binary conjunction
                     buildLattices(tensorExps[e].children.e0, i),
                     buildLattices(tensorExps[e].children.e1, i));
+  case kApply:
+    return mapSet(kind, buildLattices(tensorExps[e].children.e0, i),
+                  tensorExps[e].val, tensorExps[e].operation);
+  case kIntersect:
+    // Custom conjunction
+    return takeConj(kind, // take binary conjunction
+                    buildLattices(tensorExps[e].children.e0, i),
+                    buildLattices(tensorExps[e].children.e1, i),
+                    tensorExps[e].operation);
+  case kUnion:
+    // Custom disjunction
+    return takeDisj(kind, // take binary disjunction
+                    buildLattices(tensorExps[e].children.e0, i),
+                    buildLattices(tensorExps[e].children.e1, i),
+                    tensorExps[e].operation);
+  case kReduce:
+    return takeConj(kind,
+                    buildLattices(tensorExps[e].children.e0, i),
+                    buildLattices(tensorExps[e].children.e1, i),
+                    tensorExps[e].operation);
   }
   llvm_unreachable("unexpected expression kind");
+}
+
+Value Merger::getIdentity(PatternRewriter &rewriter, Location loc, unsigned e, Type tp) {
+  Kind kind = tensorExps[e].kind;
+  switch (kind) {
+  case kAddF:
+  case kAddI:
+  case kOrI:
+    return rewriter.create<arith::ConstantOp>(loc, tp, rewriter.getZeroAttr(tp));
+  case kMulF:
+    return rewriter.create<arith::ConstantOp>(loc, tp, rewriter.getFloatAttr(tp, 1.0));
+  case kMulI:
+  case kAndI:
+    return rewriter.create<arith::ConstantOp>(loc, tp, rewriter.getIntegerAttr(tp, 1));
+  case kReduce:
+    {
+      // Insert identity from init block
+      Operation *origOp = tensorExps[e].operation;
+      sparse_tensor::LinalgReduceOp laop = llvm::dyn_cast_or_null<sparse_tensor::LinalgReduceOp>(origOp);
+      Region &region = laop.init();
+      Block &formula = region.front();
+      LinalgYieldOp yield = dyn_cast_or_null<LinalgYieldOp>(formula.getTerminator());
+      Operation *placeholder = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+      rewriter.mergeBlockBefore(&formula, placeholder, {});
+      Value retVal = yield.result();
+      rewriter.eraseOp(placeholder);
+      rewriter.eraseOp(yield);
+      return retVal;
+    }
+  default:
+    return rewriter.create<arith::ConstantOp>(loc, tp, rewriter.getZeroAttr(tp));
+  }
 }
 
 Optional<unsigned> Merger::buildTensorExpFromLinalg(linalg::GenericOp op) {
@@ -602,6 +675,13 @@ Optional<unsigned> Merger::buildTensorExp(linalg::GenericOp op, Value v) {
         return addExp(kTruncI, e, v);
       if (isa<arith::BitcastOp>(def))
         return addExp(kBitCast, e, v);
+      if (isa<sparse_tensor::LinalgApplyOp>(def)) {
+        sparse_tensor::LinalgApplyOp laop = v.getDefiningOp<sparse_tensor::LinalgApplyOp>();
+        Region &region = laop.formula();
+        Block &formula = region.front();
+        Operation &term = formula.back();
+        return addExp(kApply, e, Value(), &term);
+      }
     }
   }
   // Construct binary operations if subexpressions can be built.
@@ -643,6 +723,22 @@ Optional<unsigned> Merger::buildTensorExp(linalg::GenericOp op, Value v) {
         return addExp(kShrU, e0, e1);
       if (isa<arith::ShLIOp>(def) && isInvariant(e1))
         return addExp(kShlI, e0, e1);
+      if (isa<sparse_tensor::LinalgIntersectOp>(def)) {
+        sparse_tensor::LinalgIntersectOp laop = v.getDefiningOp<sparse_tensor::LinalgIntersectOp>();
+        Region &region = laop.formula();
+        Block &formula = region.front();
+        Operation &term = formula.back();
+        return addExp(kIntersect, e0, e1, Value(), &term);
+      }
+      if (isa<sparse_tensor::LinalgUnionOp>(def)) {
+        sparse_tensor::LinalgUnionOp laop = v.getDefiningOp<sparse_tensor::LinalgUnionOp>();
+        Region &region = laop.formula();
+        Block &formula = region.front();
+        Operation &term = formula.back();
+        return addExp(kUnion, e0, e1, Value(), &term);
+      }
+      if (isa<sparse_tensor::LinalgReduceOp>(def))
+        return addExp(kReduce, e0, e1, Value(), def);
     }
   }
   // Cannot build.
@@ -650,7 +746,7 @@ Optional<unsigned> Merger::buildTensorExp(linalg::GenericOp op, Value v) {
 }
 
 Value Merger::buildExp(PatternRewriter &rewriter, Location loc, unsigned e,
-                       Value v0, Value v1) {
+                       Value v0, Value v1, std::vector<Value> idxs) {
   switch (tensorExps[e].kind) {
   case kTensor:
   case kInvariant:
@@ -721,6 +817,51 @@ Value Merger::buildExp(PatternRewriter &rewriter, Location loc, unsigned e,
     return rewriter.create<arith::ShRUIOp>(loc, v0, v1);
   case kShlI:
     return rewriter.create<arith::ShLIOp>(loc, v0, v1);
+  case kApply:
+    {
+      LinalgYieldOp yield = dyn_cast_or_null<LinalgYieldOp>(tensorExps[e].operation);
+      Operation *placeholder = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+      Block *block = yield->getBlock();
+      SmallVector<Value, 3> injectArgs;
+      injectArgs.push_back(v0);
+      if (block->getNumArguments() >= 2)
+        injectArgs.push_back(idxs[0]);
+      if (block->getNumArguments() >= 3)
+        injectArgs.push_back(idxs[1]);
+      rewriter.mergeBlockBefore(block, placeholder, injectArgs);
+      Value retVal = yield.result();
+      rewriter.eraseOp(placeholder);
+      rewriter.eraseOp(yield);
+      return retVal;
+    }
+  case kIntersect:
+  case kUnion:
+    {
+      // Merge the formula block into the loop
+      LinalgYieldOp yield = dyn_cast_or_null<LinalgYieldOp>(tensorExps[e].operation);
+      Operation *placeholder = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+      rewriter.mergeBlockBefore(yield->getBlock(), placeholder, {v0, v1});
+      Value retVal = yield.result();
+      rewriter.eraseOp(placeholder);
+      rewriter.eraseOp(yield);
+      return retVal;
+    }
+  case kReduce:
+    {
+      // Merge the formula block into the loop
+      Operation *origOp = tensorExps[e].operation;
+      sparse_tensor::LinalgReduceOp laop = llvm::dyn_cast_or_null<sparse_tensor::LinalgReduceOp>(origOp);
+      Region &region = laop.formula();
+      Block &formula = region.front();
+      LinalgYieldOp yield = dyn_cast_or_null<LinalgYieldOp>(formula.getTerminator());
+      Operation *placeholder = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+      rewriter.mergeBlockBefore(&formula, placeholder, {v0, v1});
+      Value retVal = yield.result();
+      rewriter.eraseOp(placeholder);
+      rewriter.eraseOp(yield);
+      return retVal;
+    }
+
   }
   llvm_unreachable("unexpected expression kind in build");
 }
