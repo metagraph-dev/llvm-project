@@ -56,7 +56,7 @@ struct CodeGen {
         idxs(numTensors, std::vector<Value>(numLoops)), redExp(-1u), redVal(), redValidLexInsert(),
         redKind(kNoReduc), sparseOut(op), outerParNest(nest), lexIdx(),
         expValues(), expFilled(), expAdded(), expCount(), curVecLength(1),
-        curVecMask(), rank(), maskLoop() {}
+        curVecMask(), rank(), maskLoop(), maskYield() {}
   /// Sparsification options.
   SparsificationOptions options;
   /// Universal dense indices and upper bounds (by index). The loops array
@@ -99,6 +99,7 @@ struct CodeGen {
   // Linalg mask variables
   unsigned rank;
   scf::IfOp maskLoop;
+  LinalgYieldOp maskYield;
 };
 
 } // namespace
@@ -910,6 +911,25 @@ static Value genAddress(CodeGen &codegen, PatternRewriter &rewriter,
   return rewriter.create<arith::AddIOp>(loc, mul, i);
 }
 
+/// Generates the mask if-statement.
+static void genMaskLoop(CodeGen &codegen, PatternRewriter &rewriter,
+                        LinalgYieldOp op, SmallVector<Value, 3> injectArgs) {
+    Location loc = op.getLoc();
+    Operation *placeholder = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+    rewriter.mergeBlockBefore(op->getBlock(), placeholder, injectArgs);
+    Value maskCmp = op.result();
+    rewriter.eraseOp(placeholder);
+    rewriter.eraseOp(op);
+
+    if (codegen.expValues) {
+      TypeRange forRetType = maskCmp.getDefiningOp()->getParentOp()->getResultTypes();
+      codegen.maskLoop = rewriter.create<scf::IfOp>(loc, forRetType, maskCmp, true);
+    } else {
+      codegen.maskLoop = rewriter.create<scf::IfOp>(loc, maskCmp);
+    }
+    rewriter.setInsertionPointToStart(codegen.maskLoop.thenBlock());
+}
+
 /// Recursively generates tensor expression.
 static Value genExp(Merger &merger, CodeGen &codegen, PatternRewriter &rewriter,
                     linalg::GenericOp op, unsigned exp, unsigned last = 0) {
@@ -932,7 +952,18 @@ static Value genExp(Merger &merger, CodeGen &codegen, PatternRewriter &rewriter,
     return genInvariantValue(merger, codegen, rewriter, exp);
   Value v0 = genExp(merger, codegen, rewriter, op, merger.exp(exp).children.e0, exp);
   Value v1 = genExp(merger, codegen, rewriter, op, merger.exp(exp).children.e1, exp);
-  return merger.buildExp(rewriter, loc, exp, v0, v1, codegen.lexIdx);
+
+  if (codegen.maskYield) {
+    // Masking based on value must be handled here
+    SmallVector<Value, 3> injectArgs;
+    injectArgs.push_back(codegen.loops[0]);
+    if (codegen.rank == 2)
+      injectArgs.push_back(codegen.loops[1]);
+    injectArgs.push_back(v0);
+    genMaskLoop(codegen, rewriter, codegen.maskYield, injectArgs);
+  }
+
+  return merger.buildExp(rewriter, loc, exp, v0, v1, codegen.loops);
 }
 
 /// Determines if affine expression is invariant.
@@ -1374,48 +1405,29 @@ static void genLocals(Merger &merger, CodeGen &codegen,
   // pattern expansion, we can skip setting the innermost dimension.
   if (codegen.sparseOut) {
     if (idx == codegen.rank - 1) {
-      // Handle linalg.mask
+      // Handle linalg_mask
       Block &block = op.region().front();
       Operation &firstOp = block.front();
       LinalgMaskOp maskOp = dyn_cast_or_null<LinalgMaskOp>(&firstOp);
       if (maskOp != nullptr) {
+        assert(codegen.rank <= 2 && "mask only supported for tensors of rank 1 or 2");
         Region &maskRegion = maskOp.expr();
         Block &maskBlock = maskRegion.front();
+        LinalgYieldOp yield = llvm::dyn_cast_or_null<LinalgYieldOp>(maskBlock.getTerminator());
 
         unsigned numArgs = maskBlock.getNumArguments();
-        SmallVector<Value, 3> injectArgs;
-        assert(codegen.rank < 3 && "mask only supported for tensors of rank 1 or 2");
         assert(numArgs > 0 && "mask block must have at least one argument");
-        if (codegen.rank == 2) {
-          injectArgs.push_back(codegen.loops[idx-1]);
-          if (numArgs >= 2)
-            injectArgs.push_back(codegen.loops[idx]);
-        } else {
-          injectArgs.push_back(codegen.loops[idx]);
-        }
-        if (numArgs > injectArgs.size()) {
-          // TODO: add the value
+        if (numArgs <= codegen.rank) {
+          SmallVector<Value, 3> injectArgs;
+          injectArgs.push_back(codegen.loops[0]);
           if (codegen.rank == 2)
-            assert(false && "mask with (row, col, val) not implemented yet");
-          else
-            assert(false && "mask with (index, val) not implemented yet");
-        }
+            injectArgs.push_back(codegen.loops[1]);
 
-        LinalgYieldOp yield =
-            llvm::dyn_cast_or_null<LinalgYieldOp>(maskBlock.getTerminator());
-        Operation *placeholder = rewriter.create<arith::ConstantIndexOp>(loc, 0);
-        rewriter.mergeBlockBefore(&maskBlock, placeholder, injectArgs);
-        Value maskCmp = yield.result();
-        rewriter.eraseOp(placeholder);
-        rewriter.eraseOp(yield);
-
-        if (codegen.expValues) {
-          TypeRange forRetType = maskCmp.getDefiningOp()->getParentOp()->getResultTypes();
-          codegen.maskLoop = rewriter.create<scf::IfOp>(loc, forRetType, maskCmp, true);
+          genMaskLoop(codegen, rewriter, yield, injectArgs);
         } else {
-          codegen.maskLoop = rewriter.create<scf::IfOp>(loc, maskCmp);
+          // Save for when value is available
+          codegen.maskYield = yield;
         }
-        rewriter.setInsertionPointToStart(codegen.maskLoop.thenBlock());
       }
     }
 

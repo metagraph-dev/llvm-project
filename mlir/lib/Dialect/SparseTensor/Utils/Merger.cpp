@@ -746,7 +746,7 @@ Optional<unsigned> Merger::buildTensorExp(linalg::GenericOp op, Value v) {
 }
 
 Value Merger::buildExp(PatternRewriter &rewriter, Location loc, unsigned e,
-                       Value v0, Value v1, Value lexIdx) {
+                       Value v0, Value v1, std::vector<Value> idxs) {
   switch (tensorExps[e].kind) {
   case kTensor:
   case kInvariant:
@@ -821,7 +821,14 @@ Value Merger::buildExp(PatternRewriter &rewriter, Location loc, unsigned e,
     {
       LinalgYieldOp yield = dyn_cast_or_null<LinalgYieldOp>(tensorExps[e].operation);
       Operation *placeholder = rewriter.create<arith::ConstantIndexOp>(loc, 0);
-      rewriter.mergeBlockBefore(yield->getBlock(), placeholder, {v0});
+      Block *block = yield->getBlock();
+      SmallVector<Value, 3> injectArgs;
+      injectArgs.push_back(v0);
+      if (block->getNumArguments() >= 2)
+        injectArgs.push_back(idxs[0]);
+      if (block->getNumArguments() >= 3)
+        injectArgs.push_back(idxs[1]);
+      rewriter.mergeBlockBefore(block, placeholder, injectArgs);
       Value retVal = yield.result();
       rewriter.eraseOp(placeholder);
       rewriter.eraseOp(yield);

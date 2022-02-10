@@ -408,8 +408,10 @@ LogicalResult LinalgReduceOp::verify() {
 LogicalResult LinalgApplyOp::verify() {
   Region &region = formula();
   Block &formula = region.front();
-  if (formula.getNumArguments() != 1)
-    return emitError("block must have 1 argument");
+  if (formula.getNumArguments() < 1)
+    return emitError("block must have at least 1 argument");
+  if (formula.getNumArguments() > 3)
+    return emitError("block must have no more than 3 arguments");
 
   Type outputType = output().getType();
   LinalgYieldOp yield =

@@ -244,7 +244,7 @@ public:
 
   /// Rebuilds SSA format from a tensor expression.
   Value buildExp(PatternRewriter &rewriter, Location loc, unsigned e, Value v0,
-                 Value v1, Value lexIdx);
+                 Value v1, std::vector<Value> idxs);
 
 private:
   /// Private helpers.
