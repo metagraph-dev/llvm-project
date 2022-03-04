@@ -212,3 +212,93 @@ func @invalid_out_dense(%arg0: tensor<10xf64>, %arg1: !llvm.ptr<i8>) {
   sparse_tensor.out %arg0, %arg1 : tensor<10xf64>, !llvm.ptr<i8>
   return
 }
+
+// -----
+
+func @invalid_binary_num_args_mismatch(%arg0: f64, %arg1: f64) -> f64 {
+  // expected-error@+1 {{primary region must have exactly 2 arguments}}
+  %r = sparse_tensor.binary %arg0, %arg1 : f64 to f64 {
+      ^bb0(%x: f64):
+        sparse_tensor.yield %x : f64
+    }
+    left={}
+    right={}
+  return %r : f64
+}
+
+// -----
+
+func @invalid_binary_argtype_mismatch(%arg0: f64, %arg1: f64) -> f64 {
+  // expected-error@+1 {{primary region argument 2 type mismatch}}
+  %r = sparse_tensor.binary %arg0, %arg1 : f64 to f64 {
+      ^bb0(%x: f64, %y: index):
+        sparse_tensor.yield %x : f64
+    }
+    left={}
+    right={}
+  return %r : f64
+}
+
+// -----
+
+func @invalid_binary_argtype_mismatch2(%arg0: f64, %arg1: f64) -> f64 {
+  // expected-error@+1 {{right region argument 2 must be IndexType}}
+  %r = sparse_tensor.binary %arg0, %arg1 {include_index=true} : f64 to f64
+    primary={}
+    left={}
+    right={
+      ^bb0(%x: f64, %y: f64, %idx: f64):
+        sparse_tensor.yield %y : f64
+    }
+  return %r : f64
+}
+
+// -----
+
+func @invalid_binary_wrong_return_type(%arg0: f64, %arg1: f64) -> f64 {
+  // expected-error@+1 {{left region yield type mismatch}}
+  %0 = sparse_tensor.binary %arg0, %arg1 : f64 to f64 { }
+    left={
+      ^bb0(%x: f64):
+        %1 = arith.constant 0.0 : f32
+        sparse_tensor.yield %1 : f32
+    }
+    right={}
+  return %0 : f64
+}
+
+// -----
+
+func @invalid_unary_argtype_mismatch(%arg0: f64) -> f64 {
+  // expected-error@+1 {{primary region argument 1 type mismatch}}
+  %r = sparse_tensor.unary %arg0 : f64 to f64 {
+      ^bb0(%x: index):
+        sparse_tensor.yield %x : index
+    }
+  return %r : f64
+}
+
+// -----
+
+func @invalid_unary_argtype_mismatch2(%arg0: f64) -> f64 {
+  // expected-error@+1 {{missing region argument 1 must be IndexType}}
+  %r = sparse_tensor.unary %arg0 {include_index=true} : f64 to f64
+    primary={}
+    missing={
+      ^bb0(%idx: f64):
+        sparse_tensor.yield %idx : f64
+    }
+  return %r : f64
+}
+
+// -----
+
+func @invalid_unary_wrong_return_type(%arg0: f64) -> f64 {
+  // expected-error@+1 {{primary region yield type mismatch}}
+  %0 = sparse_tensor.unary %arg0 : f64 to f64 {
+      ^bb0(%x: f64):
+        %1 = arith.constant 0.0 : f32
+        sparse_tensor.yield %1 : f32
+    }
+  return %0 : f64
+}

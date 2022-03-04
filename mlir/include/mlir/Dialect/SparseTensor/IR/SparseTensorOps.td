@@ -379,4 +379,183 @@ def SparseTensor_OutOp : SparseTensor_Op<"out", []>,
   let hasVerifier = 1;
 }
 
+//===----------------------------------------------------------------------===//
+// Sparse Tensor Custom Linalg.Generic Operations.
+//===----------------------------------------------------------------------===//
+
+def SparseTensor_BinaryOp : SparseTensor_Op<"binary", [NoSideEffect, SameTypeOperands]>,
+    Arguments<(ins AnyType:$x, AnyType:$y, DefaultValuedAttr<BoolAttr, "false">:$include_index)>,
+    Results<(outs AnyType:$output)> {
+  let summary = "Binary set operation utilized within linalg.generic";
+  let description = [{
+      Fulfills the need to provide iteration instructions within `linalg.generic`
+      for binary operations while separating out the computation results.
+
+      Three regions must be defined in order:
+      - primary (elements present in both sparse tensors)
+      - left (elements only present in the left sparse tensor)
+      - right (element only present in the right sparse tensor)
+
+      Each region contains a single block describing the computation and result for that
+      set region. The block must end with sparse_tensor.yield and the return type must match
+      the type of `output`.
+
+      Alternatively, the region may be left blank to indicate that the output
+      should not contain an entry for these set elements. This is typically used to indicate
+      an intersection by specifying `left={}` and `right={}`.
+
+      Another alternative is to use the special token `identity` instead of a region and
+      indicates that the return value should be the same as the input value. This is
+      only available for `left` and `right`, which have a single input value. Setting both
+      `left=identity` and `right=identity` is equivalent to a union operation.
+
+      The number of block arguments depends on the number of available values present.
+      For the primary region, two arguments are included.
+      For either the left or right region, only one argument is included.
+
+      An optional attribute "include_index" can be set to true to augment the block arguments
+      with the index or indices of the element within the tensor.
+      For example, a rank 2 tensor in the primary region would have arguments (x, y, row, column).
+      A rank 1 tensor in the right region would have arguments (y, index).
+
+      Example of isEqual applied for intersecting elements only:
+      ```mlir
+      %C = sparse_tensor.init...
+      %0 = linalg.generic #trait
+        ins(%A: tensor<?xf64, #SparseVec>, %B: tensor<?xf64, #SparseVec>)
+        outs(%C: tensor<?xi8, #SparseVec>) {
+        ^bb0(%a: f64, %b: f64, %c: i8) :
+          %result = sparse_tensor.binary %a, %b : f64 to i8 {
+              ^bb0(%arg0: f64, %arg1: f64):
+                %cmp = arith.cmpf "oeq", %arg0, %arg1 : f64
+                %ret_i8 = arith.extui %cmp : i1 to i8
+                sparse_tensor.yield %ret_i8 : i8
+            }
+            left={}
+            right={}
+          linalg.yield %result : i8
+      } -> tensor<?xi8, #SparseVec>
+      ```
+
+      Example of A+B in upper triangle, A-B in lower triangle:
+      ```mlir
+      %C = sparse_tensor.init...
+      %1 = linalg.generic #trait
+        ins(%A: tensor<?x?xf64, #CSR>, %B: tensor<?x?xf64, #CSR>
+        outs(%C: tensor<?x?xf64, #CSR> {
+        ^bb0(%a: f64, %b: f64, %c: f64) :
+          %result = sparse_tensor.binary %a, %b {include_index=true} : f64 to f64 {
+              ^bb0(%x: f64, %y: f64, %row: index, %column: index):
+                %cmp = arith.cmpi "uge", %column, %row : index
+                %upperTriangleResult = arith.addf %x, %y : f64
+                %lowerTriangleResult = arith.subf %x, %y : f64
+                %ret = arith.select %cmp, %upperTriangleResult, %lowerTriangleResult : f64
+                sparse_tensor.yield %ret : f64
+            }
+            left=identity
+            right={
+              ^bb0(%y: f64, %row: index, %column: index):
+                %cmp = arith.cmpi "uge", %column, %row : index
+                %lowerTriangleResult = arith.negf %y : f64
+                %ret = arith.select %cmp, %y, %lowerTriangleResult
+                sparse_tensor.yield %ret : f64
+            }
+          linalg.yield %result : f64
+      } -> tensor<?x?xf64, #CSR>
+      ```
+  }];
+
+  let regions = (region AnyRegion:$primaryRegion, AnyRegion:$leftRegion, AnyRegion:$rightRegion);
+  let hasCustomAssemblyFormat = 1;
+  let hasVerifier = 1;
+}
+
+def SparseTensor_UnaryOp : SparseTensor_Op<"unary", [NoSideEffect, SameTypeOperands]>,
+    Arguments<(ins AnyType:$x, DefaultValuedAttr<BoolAttr, "false">:$include_index)>,
+    Results<(outs AnyType:$output)> {
+  let summary = "Unary set operation utilized within linalg.generic";
+  let description = [{
+      Fulfills the need to provide iteration instructions within `linalg.generic`
+      for unary operations while separating out the computation results.
+
+      Two regions are defined:
+      - primary (elements present)
+      - missing (elements not present); optional
+
+      Each region contains a single block describing the computation and result for that
+      set region. The block must end with sparse_tensor.yield and the return type must match
+      the type of `output`.
+
+      Alternatively, the region may be left blank to indicate that the output
+      should not contain an entry for these set elements. This is the default behavior
+      for the missing region if not specified.
+
+      The primary region is required and takes a single block argument.
+      The missing region is optional and takes no block arguments (unless include_index is set).
+
+      An optional attribute "include_index" can be set to true to augment the block arguments
+      with the index or indices of the element within the tensor.
+      For example, a rank 1 tensor in the primary region would have arguments (x, index).
+      A rank 2 tensor in the missing region would have arguments (row, column).
+
+      Example of A+1, restricted to existing elements:
+      ```mlir
+      %C = sparse_tensor.init...
+      %0 = linalg.generic #trait
+        ins(%A: tensor<?xf64, #SparseVec>)
+        outs(%C: tensor<?xf64, #SparseVec>) {
+        ^bb0(%a: f64, %c: f64) :
+          %result = sparse_tensor.unary %a : f64 to f64 {
+              ^bb0(%arg0: f64):
+                %cf1 = arith.constant 1.0 : f64
+                %ret = arith.addf %arg0, %cf1 : f64
+                sparse_tensor.yield %ret : f64
+            }
+          linalg.yield %result : f64
+      } -> tensor<?xf64, #SparseVec>
+      ```
+
+      Example returning the column index for existing values and -1 for missing values:
+      ```mlir
+      %result = sparse_tensor.unary %a, %b {include_index=true} : f64 to i64 {
+          ^bb0(%x: f64, %row: index, %column: index):
+            %ret = arith.index_cast %column : index to i64
+            sparse_tensor.yield %column : i64
+        }
+        missing={
+          ^bb0(%row: index, %column: index):
+            %ret = arith.constant -1 : i64
+            sparse_tensor.yield %ret : i64
+        }
+      ```
+  }];
+
+  let regions = (region AnyRegion:$primaryRegion, AnyRegion:$missingRegion);
+  let hasCustomAssemblyFormat = 1;
+  let hasVerifier = 1;
+}
+
+def SparseTensor_YieldOp : SparseTensor_Op<"yield", [NoSideEffect, Terminator]> {
+  let summary = "Yield from sparse_tensor set operations";
+  let description = [{
+      Yield a value from within a block.
+      Used to terminate a block in sparse_tensor set-like operations.
+
+      Example:
+      ```
+      {
+        ^bb0(%y: i64):
+          %cst = arith.constant 1 : i64
+          %ret = arith.addi %y, %cst : i64
+          sparse_tensor.yield %ret : i64
+      }
+      ```
+  }];
+
+  let arguments = (ins AnyType:$result);
+  let assemblyFormat = [{
+        $result attr-dict `:` type($result)
+  }];
+}
+
 #endif // SPARSETENSOR_OPS

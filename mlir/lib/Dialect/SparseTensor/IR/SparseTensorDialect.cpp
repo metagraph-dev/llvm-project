@@ -13,6 +13,7 @@
 #include "mlir/IR/Matchers.h"
 #include "mlir/IR/OpImplementation.h"
 #include "llvm/ADT/TypeSwitch.h"
+#include <iostream>
 
 using namespace mlir;
 using namespace mlir::sparse_tensor;
@@ -331,6 +332,234 @@ LogicalResult OutOp::verify() {
   if (!getSparseTensorEncoding(tensor().getType()))
     return emitError("expected a sparse tensor for output");
   return success();
+}
+
+//===----------------------------------------------------------------------===//
+// TensorDialect Linalg.Generic Operations.
+//===----------------------------------------------------------------------===//
+
+template<class T>
+LogicalResult verifyNumBlockArgs(T *op, Region &region, const char *regionName, unsigned expectedNum,
+                                 Type inputType, Type outputType, bool includeIndex) {
+  unsigned numArgs = region.getNumArguments();
+  if (!includeIndex) {
+    if (numArgs != expectedNum)
+      return op->emitError() << regionName << " region must have exactly " << expectedNum << " arguments";
+  } else {
+    if (numArgs <= expectedNum)
+      return op->emitError() << regionName << " region expected to have more than " << expectedNum << " arguments";
+  }
+  for (unsigned i = 0; i < numArgs; i++) {
+    Type typ = region.getArgument(i).getType();
+    if (i < expectedNum) {
+      if (typ != inputType)
+        return op->emitError() << regionName << " region argument " << (i+1) << " type mismatch";
+    } else {
+      if (!typ.isIndex())
+        return op->emitError() << regionName << " region argument " << (i+1) << " must be IndexType";
+    }
+  }
+  Operation *term = region.front().getTerminator();
+  YieldOp yield = dyn_cast_or_null<YieldOp>(term);
+  if (!yield)
+    return op->emitError() << regionName << " region must end with sparse_tensor.yield";
+  if (yield.getOperand().getType() != outputType)
+    return op->emitError() << regionName << " region yield type mismatch";
+
+  return success();
+}
+
+LogicalResult BinaryOp::verify() {
+  bool includeIndex = include_index();
+  NamedAttrList attrs = (*this)->getAttrs();
+  Type inputType = x().getType();
+  Type outputType = output().getType();
+  LogicalResult regionResult = success();
+
+  Region &primary = primaryRegion();
+  if (!primary.empty()) {
+    regionResult = verifyNumBlockArgs(this, primary, "primary", 2, inputType, outputType, includeIndex);
+    if (failed(regionResult))
+      return regionResult;
+
+  }
+  Region &left = leftRegion();
+  if (!left.empty()) {
+    auto left_identity = attrs.get("left_identity").dyn_cast_or_null<BoolAttr>();
+    if (left_identity && left_identity.getValue())
+      return emitError("left_identity set with non-empty left region");
+    regionResult = verifyNumBlockArgs(this, left, "left", 1, inputType, outputType, includeIndex);
+    if (failed(regionResult))
+      return regionResult;
+  }
+  Region &right = rightRegion();
+  if (!right.empty()) {
+    auto right_identity = attrs.get("right_identity").dyn_cast_or_null<BoolAttr>();
+    if (right_identity && right_identity.getValue())
+      return emitError("right_identity set with non-empty right region");
+    regionResult = verifyNumBlockArgs(this, right, "right", 1, inputType, outputType, includeIndex);
+    if (failed(regionResult))
+      return regionResult;
+  }
+
+  return success();
+}
+
+ParseResult BinaryOp::parse(OpAsmParser &parser, OperationState &result) {
+  auto &builder = parser.getBuilder();
+
+  // Create the regions for 'primary', 'left', and 'right'
+  result.regions.reserve(3);
+  Region *primaryRegion = result.addRegion();
+  Region *leftRegion = result.addRegion();
+  Region *rightRegion = result.addRegion();
+
+  OpAsmParser::OperandType left, right;
+  if (parser.parseOperand(left) ||
+      parser.parseComma() || parser.parseOperand(right))
+    return failure();
+
+  // Parse the optional attribute list
+  if (parser.parseOptionalAttrDict(result.attributes))
+    return failure();
+
+  Type inputType, outputType;
+  if (parser.parseColonType(inputType) ||
+      parser.parseKeywordType("to", outputType))
+    return failure();
+
+  if (parser.resolveOperand(left, inputType, result.operands) ||
+      parser.resolveOperand(right, inputType, result.operands))
+    return failure();
+  result.types.push_back(outputType);
+
+  // Parse the 'primary' region
+  // This region has an optional "primary=" keyword
+  if (succeeded(parser.parseOptionalKeyword("primary")))
+    if (parser.parseEqual())
+      return failure();
+  if (parser.parseRegion(*primaryRegion))
+    return failure();
+  // Parse the 'left' region; might be `left=identity` helper
+  if (parser.parseKeyword("left") || parser.parseEqual())
+    return failure();
+  if (!parser.parseOptionalKeyword("identity"))
+    result.attributes.append(StringRef("left_identity"), builder.getBoolAttr(true));
+  else if (parser.parseRegion(*leftRegion))
+    return failure();
+  // Parse the 'right' region; might be `right=identity` helper
+  if (parser.parseKeyword("right") || parser.parseEqual())
+    return failure();
+  if (!parser.parseOptionalKeyword("identity"))
+    result.attributes.append(StringRef("right_identity"), builder.getBoolAttr(true));
+  else if (parser.parseRegion(*rightRegion))
+    return failure();
+
+  return success();
+}
+
+void BinaryOp::print(OpAsmPrinter &p) {
+  p << " " << x() << ", " << y();
+  NamedAttrList attrs = (*this)->getAttrs();
+  auto left_identity = attrs.erase("left_identity").dyn_cast_or_null<BoolAttr>();
+  auto right_identity = attrs.erase("right_identity").dyn_cast_or_null<BoolAttr>();
+  p.printOptionalAttrDict(attrs);
+  p << ": " << x().getType() << " to " << output().getType();
+  p << ' ';
+  p.printRegion(primaryRegion());
+  p.printNewline();
+  // Print left region (condense if identity)
+  p << "left=";
+  if (left_identity && left_identity.getValue())
+    p << "identity";
+  else if (leftRegion().empty())
+    p << "{}";
+  else
+    p.printRegion(leftRegion());
+  p.printNewline();
+  // Print right region (condense if identity)
+  p << "right=";
+  if (right_identity && right_identity.getValue())
+    p << "identity";
+  else if (rightRegion().empty())
+    p << "{}";
+  else
+    p.printRegion(rightRegion());
+}
+
+LogicalResult UnaryOp::verify() {
+  bool includeIndex = include_index();
+  Type inputType = x().getType();
+  Type outputType = output().getType();
+  LogicalResult regionResult = success();
+
+  Region &primary = primaryRegion();
+  if (!primary.empty()) {
+    regionResult = verifyNumBlockArgs(this, primary, "primary", 1, inputType, outputType, includeIndex);
+    if (failed(regionResult))
+      return regionResult;
+
+  }
+  Region &missing = missingRegion();
+  if (!missing.empty()) {
+    regionResult = verifyNumBlockArgs(this, missing, "missing", 0, inputType, outputType, includeIndex);
+    if (failed(regionResult))
+      return regionResult;
+  }
+
+  return success();
+}
+
+ParseResult UnaryOp::parse(OpAsmParser &parser, OperationState &result) {
+  // Create the regions for 'primary' and 'missing'
+  result.regions.reserve(2);
+  Region *primaryRegion = result.addRegion();
+  Region *missingRegion = result.addRegion();
+
+  OpAsmParser::OperandType inp;
+  if (parser.parseOperand(inp))
+    return failure();
+
+  // Parse the optional attribute list
+  if (parser.parseOptionalAttrDict(result.attributes))
+    return failure();
+
+  Type inputType, outputType;
+  if (parser.parseColonType(inputType) ||
+      parser.parseKeywordType("to", outputType))
+    return failure();
+
+  if (parser.resolveOperand(inp, inputType, result.operands))
+    return failure();
+  result.types.push_back(outputType);
+
+  // Parse the 'primary' region
+  // This region has an optional "primary=" keyword
+  if (succeeded(parser.parseOptionalKeyword("primary")))
+    if (parser.parseEqual())
+      return failure();
+  if (parser.parseRegion(*primaryRegion))
+    return failure();
+  // Parse the optional 'missing' region
+  if (succeeded(parser.parseOptionalKeyword("missing"))) {
+    if (parser.parseEqual() || parser.parseRegion(*missingRegion))
+      return failure();
+  }
+
+  return success();
+}
+
+void UnaryOp::print(OpAsmPrinter &p) {
+  p << " " << x();
+  p.printOptionalAttrDict((*this)->getAttrs());
+  p << ": " << x().getType() << " to " << output().getType();
+  p << ' ';
+  p.printRegion(primaryRegion());
+  if (!missingRegion().empty()) {
+    p.printNewline();
+    p << "missing=";
+    p.printRegion(missingRegion());
+  }
 }
 
 //===----------------------------------------------------------------------===//
