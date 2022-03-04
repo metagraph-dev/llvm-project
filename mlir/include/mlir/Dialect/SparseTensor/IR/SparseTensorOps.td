@@ -536,10 +536,11 @@ def SparseTensor_UnaryOp : SparseTensor_Op<"unary", [NoSideEffect, SameTypeOpera
 }
 
 def SparseTensor_YieldOp : SparseTensor_Op<"yield", [NoSideEffect, Terminator]> {
-  let summary = "Yield from sparse_tensor set operations";
+  let summary = "Yield from sparse_tensor set-like operations";
   let description = [{
       Yield a value from within a block.
-      Used to terminate a block in sparse_tensor set-like operations.
+      Used to terminate a block in sparse_tensor set-like operations, which
+      operate on different pieces of sparse tensor overlaps.
 
       Example:
       ```

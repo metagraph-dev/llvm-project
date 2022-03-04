@@ -13,7 +13,6 @@
 #include "mlir/IR/Matchers.h"
 #include "mlir/IR/OpImplementation.h"
 #include "llvm/ADT/TypeSwitch.h"
-#include <iostream>
 
 using namespace mlir;
 using namespace mlir::sparse_tensor;
